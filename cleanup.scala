@@ -1,5 +1,6 @@
 #!/usr/bin/env -S scala-cli shebang
 //> using scala 3.9.0
+//> using dep io.github.arturaz::yantl:0.4.3
 
 // Removes Proton prefixes (steamapps/compatdata/<appid>) and shader caches (steamapps/shadercache/<appid>)
 // for games that are no longer installed.
@@ -12,7 +13,7 @@
 //
 // An app is considered installed if any Steam library has steamapps/appmanifest_<appid>.acf.
 // Non-Steam shortcuts (from userdata/*/config/shortcuts.vdf) and appid 0 are always kept.
-// Game names come from Steam's local cache (appcache/appinfo.vdf); no network access.
+// Game names and Steam Cloud rules come from Steam's local caches; no network access.
 
 import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
@@ -20,6 +21,85 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets
 import scala.jdk.CollectionConverters.*
 import scala.util.{Try, Using}
+import yantl.*
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Semantic types
+
+/** Unvalidated newtype with equality and ordering of the underlying type. */
+trait SimpleNewtype[A](using ord: Ordering[A]) extends Newtype.WithoutValidationOf[A]:
+  given CanEqual[Type, Type] = CanEqual.derived
+  given Ordering[Type] = Ordering.by[Type, A](_.unwrap)(using ord)
+
+/** Steam application id. Non-Steam shortcuts use ids above 2^31. */
+object AppId extends SimpleNewtype[Long]:
+  /** Proton sometimes creates compatdata/0; it is never an orphan. */
+  val Zero: AppId = AppId(0L)
+  def parse(s: String): Option[AppId] = s.toLongOption.map(apply)
+  def fromUnsignedInt(i: Int): AppId = AppId(Integer.toUnsignedLong(i))
+type AppId = AppId.Type
+
+/** An amount of disk space. */
+object Bytes extends Newtype.WithoutValidationOf[Long] with StdLibGivens with math.Integral.ExtraImplicits:
+  val Zero: Bytes = Bytes(0L)
+  extension (b: Bytes)
+    def isZero: Boolean = b.unwrap == 0L
+    def pretty: String =
+      val units = List("B", "KiB", "MiB", "GiB", "TiB")
+      var v = b.unwrap.toDouble
+      var u = 0
+      while v >= 1024 && u < units.length - 1 do
+        v /= 1024
+        u += 1
+      f"$v%.1f ${units(u)}"
+type Bytes = Bytes.Type
+
+/** A game's display name, as known by Steam. */
+object GameName extends SimpleNewtype[String]
+type GameName = GameName.Type
+
+/** Steam's last cloud sync result for a game, e.g. "synchronized". */
+object SyncState extends SimpleNewtype[String]:
+  val Synchronized: SyncState = SyncState("synchronized")
+type SyncState = SyncState.Type
+
+/** A Windows user folder inside a Proton prefix, relative to drive_c/users/steamuser, e.g. "AppData/LocalLow". */
+object UserFolder extends SimpleNewtype[String]
+type UserFolder = UserFolder.Type
+
+/** A Steam Auto-Cloud root name, e.g. "WinAppDataLocalLow". */
+object CloudRoot extends SimpleNewtype[String]
+type CloudRoot = CloudRoot.Type
+
+/** Name of a single file or folder directly inside a [[UserFolder]], usually the game's or studio's name. */
+object EntryName extends SimpleNewtype[String]
+type EntryName = EntryName.Type
+
+/** The Steam installation directory (the one with userdata/, appcache/, ...). */
+object SteamDir extends Newtype.WithoutValidationOf[Path]:
+  extension (d: SteamDir)
+    def userdataDirs: List[Path] = listDir(d.unwrap.resolve("userdata"))
+    def appInfoVdf: Path = d.unwrap.resolve("appcache/appinfo.vdf")
+    def libraryFoldersVdf: Path = d.unwrap.resolve("steamapps/libraryfolders.vdf")
+    def asLibrary: LibraryDir = LibraryDir(d.unwrap)
+type SteamDir = SteamDir.Type
+
+/** A Steam library directory (the one containing steamapps/). */
+object LibraryDir extends Newtype.WithoutValidationOf[Path]:
+  given CanEqual[LibraryDir, LibraryDir] = CanEqual.derived
+  extension (d: LibraryDir)
+    def steamapps: Path = d.unwrap.resolve("steamapps")
+    def leftovers(kind: LeftoverKind): Path = steamapps.resolve(kind.dirName)
+type LibraryDir = LibraryDir.Type
+
+/** Kinds of per-app data Steam leaves behind after uninstalling. */
+enum LeftoverKind(val dirName: String):
+  /** Proton/Wine prefix: steamapps/compatdata/<appid>. */
+  case Prefix extends LeftoverKind("compatdata")
+  /** Compiled shader cache: steamapps/shadercache/<appid>. */
+  case ShaderCache extends LeftoverKind("shadercache")
+
+case class Leftover(kind: LeftoverKind, path: Path, size: Bytes)
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Arguments
@@ -27,16 +107,16 @@ import scala.util.{Try, Using}
 enum Mode:
   case DryRun, Delete, Interactive
 
-case class Args(steamDir: Path, mode: Mode)
+case class Args(steamDir: SteamDir, mode: Mode)
 
 val usage = "Usage: cleanup.scala [--delete | --interactive|-i] [--steam-dir <path>]"
 
 def parseArgs(args: List[String], acc: Args): Args = args match
-  case Nil                                       => acc
-  case "--delete" :: rest                        => parseArgs(rest, acc.copy(mode = Mode.Delete))
-  case ("--interactive" | "-i") :: rest          => parseArgs(rest, acc.copy(mode = Mode.Interactive))
-  case "--steam-dir" :: dir :: rest              => parseArgs(rest, acc.copy(steamDir = Paths.get(dir)))
-  case ("--help" | "-h") :: _                    => println(usage); sys.exit(0)
+  case Nil                              => acc
+  case "--delete" :: rest               => parseArgs(rest, acc.copy(mode = Mode.Delete))
+  case ("--interactive" | "-i") :: rest => parseArgs(rest, acc.copy(mode = Mode.Interactive))
+  case "--steam-dir" :: dir :: rest     => parseArgs(rest, acc.copy(steamDir = SteamDir(Paths.get(dir))))
+  case ("--help" | "-h") :: _           => println(usage); sys.exit(0)
   case other :: _ =>
     System.err.println(s"Unknown argument: $other\n$usage")
     sys.exit(2)
@@ -49,7 +129,7 @@ def listDir(dir: Path): List[Path] =
   else Using.resource(Files.list(dir))(_.iterator.asScala.toList.sortBy(_.getFileName.toString))
 
 /** Total size of regular files in a tree, not following symlinks. */
-def treeSize(path: Path): Long =
+def treeSize(path: Path): Bytes =
   var total = 0L
   Files.walkFileTree(
     path,
@@ -59,7 +139,7 @@ def treeSize(path: Path): Long =
         FileVisitResult.CONTINUE
       override def visitFileFailed(f: Path, e: java.io.IOException) = FileVisitResult.CONTINUE
   )
-  total
+  Bytes(total)
 
 /** Recursively deletes a tree, deleting symlinks themselves rather than their targets. */
 def deleteTree(dir: Path): Unit =
@@ -75,67 +155,9 @@ def deleteTree(dir: Path): Unit =
         FileVisitResult.CONTINUE
   )
 
-def human(bytes: Long): String =
-  val units = List("B", "KiB", "MiB", "GiB", "TiB")
-  var v = bytes.toDouble
-  var u = 0
-  while v >= 1024 && u < units.length - 1 do
-    v /= 1024
-    u += 1
-  f"$v%.1f ${units(u)}"
-
 // ---------------------------------------------------------------------------------------------------------------------
-// Steam metadata
+// VDF (Valve KeyValues) parsing. Keys and values are plain strings at this level; callers wrap them in semantic types.
 
-/** Library roots from steamapps/libraryfolders.vdf (always includes the main Steam dir). */
-def libraryRoots(steamDir: Path): List[Path] =
-  val vdf = steamDir.resolve("steamapps/libraryfolders.vdf")
-  val fromVdf =
-    if !Files.isRegularFile(vdf) then Nil
-    else
-      val PathLine = """(?m)^\s*"path"\s+"((?:[^"\\]|\\.)*)"""".r
-      PathLine
-        .findAllMatchIn(Files.readString(vdf))
-        .map(m => Paths.get(m.group(1).replace("\\\\", "\\")))
-        .toList
-  (steamDir :: fromVdf).map(_.toAbsolutePath.normalize).distinct.filter(p => Files.isDirectory(p.resolve("steamapps")))
-
-/** App ids that have an appmanifest in any library. */
-def installedAppIds(libraries: List[Path]): Set[Long] =
-  val Manifest = """appmanifest_(\d+)\.acf""".r
-  libraries
-    .flatMap(lib => listDir(lib.resolve("steamapps")))
-    .flatMap(p => p.getFileName.toString match
-      case Manifest(id) => Some(id.toLong)
-      case _            => None
-    )
-    .toSet
-
-/** App ids of non-Steam shortcuts. shortcuts.vdf is binary VDF: 0x02 "appid" 0x00 <int32 LE>. */
-def shortcutAppIds(steamDir: Path): Set[Long] =
-  val marker = "\u0002appid\u0000".getBytes(StandardCharsets.ISO_8859_1)
-  listDir(steamDir.resolve("userdata"))
-    .map(_.resolve("config/shortcuts.vdf"))
-    .filter(Files.isRegularFile(_))
-    .flatMap { file =>
-      val bytes = Files.readAllBytes(file)
-      // Case-insensitive match: older Steam versions wrote "AppID".
-      val lower = bytes.map(b => if b >= 'A' && b <= 'Z' then (b + 32).toByte else b)
-      (0 to bytes.length - marker.length - 4)
-        .filter(i => java.util.Arrays.equals(lower, i, i + marker.length, marker, 0, marker.length))
-        .map(i => Integer.toUnsignedLong(ByteBuffer.wrap(bytes, i + marker.length, 4).order(ByteOrder.LITTLE_ENDIAN).getInt))
-    }
-    .toSet
-
-/** Reads app names (appinfo > common > name) for the given ids from appcache/appinfo.vdf.
-  *
-  * Format (versions 0x27, 0x28, 0x29 of magic 0x075644xx):
-  *   header: u32 magic, u32 universe, [v29: i64 string table offset]
-  *   per app: u32 appid (0 = end), u32 size, then `size` bytes:
-  *     u32 infoState, u32 lastUpdated, u64 picsToken, 20b sha1, u32 changeNumber, [v28+: 20b binary sha1], binary KV
-  *   binary KV entry: u8 type (0x08 = end of map), key (v29: i32 string table index, else C string), value.
-  * Returns an empty map if the file is missing or in an unknown format.
-  */
 type KV = Map[String, Any]
 
 extension (kv: KV)
@@ -145,17 +167,116 @@ extension (kv: KV)
       case (Some(m: Map[?, ?]), k) => m.asInstanceOf[KV].get(k)
       case _                       => None
     }
-  def str(path: String*): Option[String] = at(path*).collect { case s: String => s }
-  def obj(path: String*): Option[KV] = at(path*).collect { case m: Map[?, ?] => m.asInstanceOf[KV] }
   /** Like `at`, but matches keys case-insensitively (Steam's text VDF files are inconsistent about case). */
   def ci(path: String*): Option[Any] =
     path.foldLeft(Option[Any](kv)) {
       case (Some(m: Map[?, ?]), k) => m.asInstanceOf[KV].collectFirst { case (key, v) if key.equalsIgnoreCase(k) => v }
       case _                       => None
     }
+  def str(path: String*): Option[String] = at(path*).collect { case s: String => s }
+  def obj(path: String*): Option[KV] = at(path*).flatMap(asKV)
+  /** Child maps, ignoring scalar values. */
+  def children: List[KV] = kv.values.toList.flatMap(asKV)
 
-def appInfos(steamDir: Path, wanted: Set[Long]): Map[Long, KV] =
-  val file = steamDir.resolve("appcache/appinfo.vdf")
+def asKV(a: Any): Option[KV] = a match
+  case m: Map[?, ?] => Some(m.asInstanceOf[KV])
+  case _            => None
+
+/** Minimal parser for Steam's text VDF format. Nested maps and string values. */
+def parseTextVdf(s: String): KV =
+  var i = 0
+  def skipWs(): Unit =
+    while i < s.length && (s(i).isWhitespace || s.startsWith("//", i)) do
+      if s(i) == '/' then while i < s.length && s(i) != '\n' do i += 1
+      else i += 1
+  def token(): String =
+    if s(i) == '"' then
+      val sb = StringBuilder()
+      i += 1
+      while i < s.length && s(i) != '"' do
+        if s(i) == '\\' && i + 1 < s.length then
+          sb += (s(i + 1) match { case 'n' => '\n'; case 't' => '\t'; case c => c })
+          i += 2
+        else
+          sb += s(i)
+          i += 1
+      i += 1
+      sb.result()
+    else
+      val start = i
+      while i < s.length && !s(i).isWhitespace && s(i) != '{' && s(i) != '}' do i += 1
+      s.substring(start, i)
+  def obj(): KV =
+    val b = Map.newBuilder[String, Any]
+    skipWs()
+    while i < s.length && s(i) != '}' do
+      val k = token()
+      skipWs()
+      if i < s.length && s(i) == '{' then
+        i += 1
+        b += k -> obj()
+        i += 1 // closing brace
+      else b += k -> token()
+      skipWs()
+    b.result()
+  obj()
+
+def readTextVdf(file: Path): Option[KV] =
+  if !Files.isRegularFile(file) then None else Try(parseTextVdf(Files.readString(file))).toOption
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Steam metadata
+
+/** Library dirs from steamapps/libraryfolders.vdf (always includes the main Steam dir). */
+def libraryDirs(steamDir: SteamDir): List[LibraryDir] =
+  val fromVdf = readTextVdf(steamDir.libraryFoldersVdf).toList
+    .flatMap(_.ci("libraryfolders").flatMap(asKV).toList)
+    .flatMap(_.children)
+    .flatMap(_.str("path"))
+    .map(p => LibraryDir(Paths.get(p)))
+  (steamDir.asLibrary :: fromVdf)
+    .map(d => LibraryDir(d.unwrap.toAbsolutePath.normalize))
+    .distinct
+    .filter(d => Files.isDirectory(d.steamapps))
+
+/** App ids that have an appmanifest in any library. */
+def installedAppIds(libraries: List[LibraryDir]): Set[AppId] =
+  val Manifest = """appmanifest_(\d+)\.acf""".r
+  libraries
+    .flatMap(lib => listDir(lib.steamapps))
+    .flatMap(p => p.getFileName.toString match
+      case Manifest(id) => AppId.parse(id)
+      case _            => None
+    )
+    .toSet
+
+/** App ids of non-Steam shortcuts. shortcuts.vdf is binary VDF: 0x02 "appid" 0x00 <int32 LE>. */
+def shortcutAppIds(steamDir: SteamDir): Set[AppId] =
+  val marker = "\u0002appid\u0000".getBytes(StandardCharsets.ISO_8859_1)
+  steamDir.userdataDirs
+    .map(_.resolve("config/shortcuts.vdf"))
+    .filter(Files.isRegularFile(_))
+    .flatMap { file =>
+      val bytes = Files.readAllBytes(file)
+      // Case-insensitive match: older Steam versions wrote "AppID".
+      val lower = bytes.map(b => if b >= 'A' && b <= 'Z' then (b + 32).toByte else b)
+      (0 to bytes.length - marker.length - 4)
+        .filter(i => java.util.Arrays.equals(lower, i, i + marker.length, marker, 0, marker.length))
+        .map(i => AppId.fromUnsignedInt(ByteBuffer.wrap(bytes, i + marker.length, 4).order(ByteOrder.LITTLE_ENDIAN).getInt))
+    }
+    .toSet
+
+/** Reads the "appinfo" section for the given ids from appcache/appinfo.vdf.
+  *
+  * Format (versions 0x27, 0x28, 0x29 of magic 0x075644xx):
+  *   header: u32 magic, u32 universe, [v29: i64 string table offset]
+  *   per app: u32 appid (0 = end), u32 size, then `size` bytes:
+  *     u32 infoState, u32 lastUpdated, u64 picsToken, 20b sha1, u32 changeNumber, [v28+: 20b binary sha1], binary KV
+  *   binary KV entry: u8 type (0x08 = end of map), key (v29: i32 string table index, else C string), value.
+  * Returns an empty map if the file is missing or in an unknown format.
+  */
+def appInfos(steamDir: SteamDir, wanted: Set[AppId]): Map[AppId, KV] =
+  val file = steamDir.appInfoVdf
   if wanted.isEmpty || !Files.isRegularFile(file) then return Map.empty
   Try {
     val buf = ByteBuffer.wrap(Files.readAllBytes(file)).order(ByteOrder.LITTLE_ENDIAN)
@@ -199,152 +320,113 @@ def appInfos(steamDir: Path, wanted: Set[Long]): Map[Long, KV] =
         tpe = buf.get & 0xff
       b.result()
 
-    val infos = Map.newBuilder[Long, KV]
-    var appId = Integer.toUnsignedLong(buf.getInt)
-    while appId != 0 do
+    val infos = Map.newBuilder[AppId, KV]
+    var appId = AppId.fromUnsignedInt(buf.getInt)
+    while appId != AppId.Zero do
       val size = buf.getInt
       val next = buf.position + size
       if wanted.contains(appId) then
         buf.position(buf.position + 4 + 4 + 8 + 20 + 4 + (if version >= 0x28 then 20 else 0))
         readMap().obj("appinfo").foreach(info => infos += appId -> info)
       buf.position(next)
-      appId = Integer.toUnsignedLong(buf.getInt)
+      appId = AppId.fromUnsignedInt(buf.getInt)
     infos.result()
   }.recover { case e =>
     System.err.println(s"Warning: could not read Steam app cache $file: $e")
     Map.empty
   }.get
 
+def gameName(info: KV): Option[GameName] = info.str("common", "name").map(GameName(_))
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Save data detection
 
-/** Folders inside a prefix where games commonly keep saves and settings (relative to drive_c/users/steamuser). */
-val saveRoots = List("AppData/Local", "AppData/LocalLow", "AppData/Roaming", "Documents", "Saved Games")
+/** Folders inside a prefix where games commonly keep saves and settings. */
+val saveFolders: List[UserFolder] =
+  List("AppData/Local", "AppData/LocalLow", "AppData/Roaming", "Documents", "Saved Games").map(UserFolder(_))
 
 /** Entries that Wine/Proton/runtimes create in every prefix and that never hold game saves. */
-val notSaves = Set("Microsoft", "Temp", "openvr", "dxvk", "vkd3d", "vkd3d-proton", "mesa_shader_cache", "UnrealEngine",
-  "Downloads", "Music", "Pictures", "Templates", "Videos")
+val notSaves: Set[EntryName] = Set("Microsoft", "Temp", "openvr", "dxvk", "vkd3d", "vkd3d-proton",
+  "mesa_shader_cache", "UnrealEngine", "Downloads", "Music", "Pictures", "Templates", "Videos").map(EntryName(_))
 
 enum Cloud:
   /** An Auto-Cloud rule covers this folder and Steam's last sync for the game succeeded. */
   case Synced
   /** An Auto-Cloud rule covers this folder, but the last sync state is not "synchronized" (or unknown). */
-  case Unconfirmed(state: Option[String])
+  case Unconfirmed(state: Option[SyncState])
   /** The game uses Steam Cloud, but none of its rules cover this folder. */
   case NotCovered
   /** The game does not use Steam Cloud at all. */
   case NoCloud
 
-/** A non-empty, game-created folder in a prefix's usual save locations. `root` is e.g. "AppData/LocalLow". */
-case class Save(root: String, entry: String, size: Long, cloud: Cloud):
-  def path: String = s"$root/$entry"
+/** A non-empty, game-created file or folder in one of a prefix's save folders. */
+case class Save(folder: UserFolder, entry: EntryName, size: Bytes, cloud: Cloud):
+  def path: String = s"$folder/$entry"
 
 /** Non-empty, game-created entries in the usual save locations of a prefix. */
-def likelySaves(compatdata: Path, cloud: (String, String) => Cloud): List[Save] =
-  val user = compatdata.resolve("pfx/drive_c/users/steamuser")
+def likelySaves(prefix: Path, cloud: (UserFolder, EntryName) => Cloud): List[Save] =
+  val user = prefix.resolve("pfx/drive_c/users/steamuser")
   for
-    root  <- saveRoots
-    entry <- listDir(user.resolve(root))
-    name = entry.getFileName.toString
-    if !Files.isSymbolicLink(entry) && !notSaves.contains(name)
-    size = treeSize(entry)
-    if size > 0
-  yield Save(root, name, size, cloud(root, name))
+    folder <- saveFolders
+    path   <- listDir(user.resolve(folder.unwrap))
+    entry = EntryName(path.getFileName.toString)
+    if !Files.isSymbolicLink(path) && !notSaves.contains(entry)
+    size = treeSize(path)
+    if !size.isZero
+  yield Save(folder, entry, size, cloud(folder, entry))
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Steam Cloud
 
-/** Minimal parser for Steam's text VDF (KeyValues) format. Nested maps and string values. */
-def parseTextVdf(s: String): KV =
-  var i = 0
-  def skipWs(): Unit =
-    while i < s.length && (s(i).isWhitespace || s.startsWith("//", i)) do
-      if s(i) == '/' then while i < s.length && s(i) != '\n' do i += 1
-      else i += 1
-  def token(): String =
-    if s(i) == '"' then
-      val sb = StringBuilder()
-      i += 1
-      while i < s.length && s(i) != '"' do
-        if s(i) == '\\' && i + 1 < s.length then
-          sb += (s(i + 1) match { case 'n' => '\n'; case 't' => '\t'; case c => c })
-          i += 2
-        else
-          sb += s(i)
-          i += 1
-      i += 1
-      sb.result()
-    else
-      val start = i
-      while i < s.length && !s(i).isWhitespace && s(i) != '{' && s(i) != '}' do i += 1
-      s.substring(start, i)
-  def obj(): KV =
-    val b = Map.newBuilder[String, Any]
-    skipWs()
-    while i < s.length && s(i) != '}' do
-      val k = token()
-      skipWs()
-      if i < s.length && s(i) == '{' then
-        i += 1
-        b += k -> obj()
-        i += 1 // closing brace
-      else b += k -> token()
-      skipWs()
-    b.result()
-  obj()
-
-/** Steam Auto-Cloud root names → folder inside a Proton prefix's drive_c/users/steamuser. */
-val cloudRoots = Map(
+/** Steam Auto-Cloud roots → the matching folder inside a Proton prefix. */
+val cloudRoots: Map[CloudRoot, UserFolder] = Map(
   "WinAppDataLocal"    -> "AppData/Local",
   "WinAppDataLocalLow" -> "AppData/LocalLow",
   "WinAppDataRoaming"  -> "AppData/Roaming",
   "WinMyDocuments"     -> "Documents",
   "WinSavedGames"      -> "Saved Games"
-)
+).map((root, folder) => CloudRoot(root) -> UserFolder(folder))
 
-/** Last Steam Cloud sync state per app id ("synchronized", ...), across all local Steam users. */
-def cloudSyncStates(steamDir: Path): Map[Long, List[String]] =
-  listDir(steamDir.resolve("userdata"))
-    .map(_.resolve("config/localconfig.vdf"))
-    .filter(Files.isRegularFile(_))
-    .flatMap { file =>
-      Try(parseTextVdf(Files.readString(file))).toOption.toList.flatMap { vdf =>
-        val apps = vdf.values.collect { case m: Map[?, ?] => m.asInstanceOf[KV] }
-          .flatMap(_.ci("Software", "Valve", "Steam", "apps").collect { case m: Map[?, ?] => m.asInstanceOf[KV] })
-          .headOption.getOrElse(Map.empty)
-        apps.toList.flatMap { (id, app) =>
-          for
-            appId <- id.toLongOption
-            state <- app.asInstanceOf[Any] match
-              case m: Map[?, ?] => m.asInstanceOf[KV].ci("cloud", "last_sync_state").collect { case s: String => s }
-              case _            => None
-          yield appId -> state
-        }
+/** Last Steam Cloud sync state per app, across all local Steam users (userdata/<user>/config/localconfig.vdf). */
+def cloudSyncStates(steamDir: SteamDir): Map[AppId, List[SyncState]] =
+  steamDir.userdataDirs
+    .flatMap(user => readTextVdf(user.resolve("config/localconfig.vdf")))
+    .flatMap { vdf =>
+      val apps = vdf.children.flatMap(_.ci("Software", "Valve", "Steam", "apps").flatMap(asKV)).headOption
+      apps.toList.flatMap(_.toList).flatMap { (id, app) =>
+        for
+          appId <- AppId.parse(id)
+          app   <- asKV(app)
+          state <- app.ci("cloud", "last_sync_state").collect { case s: String => SyncState(s) }
+        yield appId -> state
       }
     }
     .groupMap(_._1)(_._2)
 
-/** Decides whether a prefix folder (`root`/`entry`) of an app is backed up by Steam Cloud. */
-def cloudStatus(info: Option[KV], syncStates: Map[Long, List[String]], appId: Long)(root: String, entry: String): Cloud =
+/** Decides whether a prefix entry (`folder`/`entry`) of an app is backed up by Steam Cloud. */
+def cloudStatus(info: Option[KV], syncStates: Map[AppId, List[SyncState]], appId: AppId)(
+    folder: UserFolder,
+    entry: EntryName
+): Cloud =
   info.flatMap(_.obj("ufs")) match
     case None => Cloud.NoCloud
     case Some(ufs) =>
-      val rules = ufs.obj("savefiles").toList.flatMap(_.values).collect { case m: Map[?, ?] => m.asInstanceOf[KV] }
+      val rules = ufs.obj("savefiles").toList.flatMap(_.children)
       val covered = rules.exists { rule =>
-        val windows = rule.obj("platforms").forall(_.values.exists(v => v == "Windows" || v == "all"))
-        val firstSegment = rule.str("path").getOrElse("").split("[/\\\\]").headOption.getOrElse("")
-        windows && rule.str("root").flatMap(cloudRoots.get).contains(root) &&
-          (firstSegment.isEmpty || firstSegment.equalsIgnoreCase(entry))
+        val forWindows = rule.obj("platforms").forall(_.values.exists(v => v == "Windows" || v == "all"))
+        val ruleFolder = rule.str("root").map(CloudRoot(_)).flatMap(cloudRoots.get)
+        val ruleEntry = rule.str("path").getOrElse("").split("[/\\\\]").headOption.filter(_.nonEmpty)
+        forWindows && ruleFolder.contains(folder) && ruleEntry.forall(_.equalsIgnoreCase(entry.unwrap))
       }
       if !covered then Cloud.NotCovered
       else
         // Demos often sync into the full game's cloud storage.
-        val cloudId = ufs.str("appidredirect").flatMap(_.toLongOption).getOrElse(appId)
+        val cloudId = ufs.str("appidredirect").flatMap(AppId.parse).getOrElse(appId)
         val states = syncStates.getOrElse(cloudId, Nil) ++ syncStates.getOrElse(appId, Nil)
-        if states.contains("synchronized") then Cloud.Synced else Cloud.Unconfirmed(states.headOption)
+        if states.contains(SyncState.Synchronized) then Cloud.Synced else Cloud.Unconfirmed(states.headOption)
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Main
+// Output
 
 /** ANSI styling, disabled when stdout is not a terminal or NO_COLOR is set. */
 object Style:
@@ -372,16 +454,18 @@ def displayWidth(s: String): Int =
 def padLeft(s: String, w: Int): String = " " * (w - displayWidth(s)).max(0) + s
 def padRight(s: String, w: Int): String = s + " " * (w - displayWidth(s)).max(0)
 
-case class Orphan(appId: Long, name: Option[String], dirs: List[(Path, Long)], saves: List[Save]):
-  def size: Long = dirs.map(_._2).sum
+case class Orphan(appId: AppId, name: Option[GameName], leftovers: List[Leftover], saves: List[Save]):
+  def size: Bytes = leftovers.map(_.size).sum
   def backedUp: Boolean = saves.nonEmpty && saves.forall(_.cloud == Cloud.Synced)
-  def displayName: String = name.getOrElse(s"Unknown app $appId")
-  private def has(kind: String) = dirs.exists(_._1.getParent.getFileName.toString == kind)
+  def displayName: String = name.fold(s"Unknown app $appId")(_.unwrap)
+  private def has(kind: LeftoverKind) = leftovers.exists(_.kind == kind)
   /** Extra note when leftovers aren't just a Proton prefix. */
-  def kindNote: Option[String] = (has("compatdata"), has("shadercache")) match
+  def kindNote: Option[String] = (has(LeftoverKind.Prefix), has(LeftoverKind.ShaderCache)) match
     case (true, true)  => Some("prefix + shader cache")
     case (false, true) => Some("shader cache only")
     case _             => None
+
+def totalSize(os: List[Orphan]): Bytes = os.map(_.size).sum
 
 val sizeW = 10
 
@@ -390,7 +474,7 @@ def printSection(heading: String, games: List[Orphan], nameW: Int): Unit =
   if games.isEmpty then return
   println(heading)
   games.foreach { o =>
-    val size = if o.size == 0 then dim(human(o.size)) else human(o.size)
+    val size = if o.size.isZero then dim(o.size.pretty) else o.size.pretty
     val name = if o.name.isEmpty then dim(o.displayName) else bold(o.displayName)
     val note = o.kindNote.map(n => s"  ${dim(n)}").getOrElse("")
     println(s"    ${padRight(name, nameW)}  ${padLeft(size, sizeW)}  ${dim(s"#${o.appId}")}$note")
@@ -398,23 +482,26 @@ def printSection(heading: String, games: List[Orphan], nameW: Int): Unit =
       val branch = if i == o.saves.length - 1 then "└─" else "├─"
       val (color, status) = save.cloud match
         case Cloud.Synced             => (green, "☁ in Steam Cloud")
-        case Cloud.Unconfirmed(state) => (yellow, s"☁ Steam Cloud, last sync: ${state.getOrElse("unknown")}")
+        case Cloud.Unconfirmed(state) => (yellow, s"☁ Steam Cloud, last sync: ${state.fold("unknown")(_.unwrap)}")
         case Cloud.NotCovered         => (red, "✗ not synced by Steam Cloud")
         case Cloud.NoCloud            => (red, "✗ game has no Steam Cloud")
-      println(s"      ${padRight(s"$branch ${save.path}", nameW - 2)}  ${padLeft(human(save.size), sizeW)}  ${color(status)}")
+      println(s"      ${padRight(s"$branch ${save.path}", nameW - 2)}  ${padLeft(save.size.pretty, sizeW)}  ${color(status)}")
     }
   }
   println()
 
-def delete(o: Orphan): Long =
-  o.dirs.map { (d, size) =>
+// ---------------------------------------------------------------------------------------------------------------------
+// Deletion
+
+def delete(o: Orphan): Bytes =
+  o.leftovers.map { l =>
     try
-      deleteTree(d)
-      println(s"    ${green("✓")} deleted ${dim(d.toString)}")
-      size
+      deleteTree(l.path)
+      println(s"    ${green("✓")} deleted ${dim(l.path.toString)}")
+      l.size
     catch case e: Exception =>
-      System.err.println(s"    ${red("✗")} failed to delete $d: ${e.getMessage}")
-      0L
+      System.err.println(s"    ${red("✗")} failed to delete ${l.path}: ${e.getMessage}")
+      Bytes.Zero
   }.sum
 
 enum Answer:
@@ -425,43 +512,47 @@ def ask(o: Orphan): Answer =
     if o.saves.isEmpty then ""
     else if o.backedUp then green(" — saves are in Steam Cloud")
     else red(" — saves NOT backed up!")
-  print(s"Delete ${bold(o.displayName)} (${human(o.size)})$warning ${dim("[y/N/a(ll)/q(uit)]")} ")
+  print(s"Delete ${bold(o.displayName)} (${o.size.pretty})$warning ${dim("[y/N/a(ll)/q(uit)]")} ")
   Console.flush()
   Option(scala.io.StdIn.readLine()).map(_.trim.toLowerCase) match
-    case None                       => Answer.Quit // EOF
-    case Some("y" | "yes")          => Answer.Yes
-    case Some("a" | "all")          => Answer.All
-    case Some("q" | "quit")         => Answer.Quit
-    case Some(_)                    => Answer.No
+    case None               => Answer.Quit // EOF
+    case Some("y" | "yes")  => Answer.Yes
+    case Some("a" | "all")  => Answer.All
+    case Some("q" | "quit") => Answer.Quit
+    case Some(_)            => Answer.No
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Main
 
 @main def run(rawArgs: String*): Unit =
-  val args = parseArgs(rawArgs.toList, Args(Paths.get(sys.props("user.home"), ".local/share/Steam"), Mode.DryRun))
+  val defaultSteamDir = SteamDir(Paths.get(sys.props("user.home"), ".local/share/Steam"))
+  val args = parseArgs(rawArgs.toList, Args(defaultSteamDir, Mode.DryRun))
 
-  val libraries = libraryRoots(args.steamDir)
+  val libraries = libraryDirs(args.steamDir)
   if libraries.isEmpty then
     System.err.println(s"No Steam libraries found under ${args.steamDir}")
     sys.exit(1)
 
   val installed = installedAppIds(libraries)
   val shortcuts = shortcutAppIds(args.steamDir)
-  val keep = installed ++ shortcuts + 0L
+  val keep = installed ++ shortcuts + AppId.Zero
 
-  println(dim(s"Steam libraries: ${libraries.mkString(", ")}"))
   def plural(n: Int, word: String) = s"$n $word${if n == 1 then "" else "s"}"
+  println(dim(s"Steam libraries: ${libraries.mkString(", ")}"))
   println(dim(s"Keeping ${plural(installed.size, "installed app")} and ${plural(shortcuts.size, "non-Steam shortcut")}."))
   if installed.isEmpty then
     System.err.println("No appmanifests found — refusing to continue (would delete everything).")
     sys.exit(1)
 
-  val orphanDirs: Map[Long, List[Path]] =
+  val orphanDirs: Map[AppId, List[(LeftoverKind, Path)]] =
     (for
-      lib  <- libraries
-      kind <- List("compatdata", "shadercache")
-      dir  <- listDir(lib.resolve("steamapps").resolve(kind))
+      lib   <- libraries
+      kind  <- LeftoverKind.values.toList
+      dir   <- listDir(lib.leftovers(kind))
       if Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)
-      id   <- dir.getFileName.toString.toLongOption
-      if !keep.contains(id)
-    yield id -> dir).groupMap(_._1)(_._2)
+      appId <- AppId.parse(dir.getFileName.toString)
+      if !keep.contains(appId)
+    yield appId -> (kind, dir)).groupMap(_._1)(_._2)
 
   if orphanDirs.isEmpty then
     println(green("\nNothing to clean up."))
@@ -470,27 +561,27 @@ def ask(o: Orphan): Answer =
   val infos = appInfos(args.steamDir, orphanDirs.keySet)
   val syncStates = cloudSyncStates(args.steamDir)
   val all = orphanDirs.toList
-    .map { (id, dirs) =>
-      val info = infos.get(id)
-      val saves = dirs
-        .filter(_.getParent.getFileName.toString == "compatdata")
-        .flatMap(likelySaves(_, cloudStatus(info, syncStates, id)))
-      Orphan(id, info.flatMap(_.str("common", "name")), dirs.map(d => d -> treeSize(d)), saves)
+    .map { (appId, dirs) =>
+      val info = infos.get(appId)
+      val saves = dirs.collect { case (LeftoverKind.Prefix, dir) => dir }
+        .flatMap(likelySaves(_, cloudStatus(info, syncStates, appId)))
+      val leftovers = dirs.map((kind, dir) => Leftover(kind, dir, treeSize(dir)))
+      Orphan(appId, info.flatMap(gameName), leftovers, saves)
     }
-    .sortBy(o => (-o.size, o.appId))
+    .sortBy(o => (-o.size.unwrap, o.appId)) // largest first
   val notBackedUp = all.filter(o => o.saves.nonEmpty && !o.backedUp)
   val backedUp = all.filter(_.backedUp)
   val noSaves = all.filter(_.saves.isEmpty)
   val orphans = notBackedUp ++ backedUp ++ noSaves // display order = interactive order
 
-  def games(n: Int) = s"$n game${if n == 1 then "" else "s"}"
-  def summary(os: List[Orphan]) = s"${games(os.size)}, ${human(os.map(_.size).sum)}"
+  def games(n: Int) = plural(n, "game")
+  def summary(os: List[Orphan]) = s"${games(os.size)}, ${totalSize(os).pretty}"
 
   val nameW = (orphans.map(o => displayWidth(o.displayName)) ++
     orphans.flatMap(_.saves.map(s => displayWidth(s.path) + 5))).max.min(60)
 
   println()
-  println(bold(s"Uninstalled games are using ${human(orphans.map(_.size).sum)}") + dim(s" (${games(orphans.size)})"))
+  println(bold(s"Uninstalled games are using ${totalSize(orphans).pretty}") + dim(s" (${games(orphans.size)})"))
   println()
   printSection(
     red(bold("✗ Saves not backed up")) + dim(s" (${summary(notBackedUp)}) — deleting loses them for good"),
@@ -510,12 +601,12 @@ def ask(o: Orphan): Answer =
         s"or ${bold("--delete")} to remove all.")
     case Mode.Delete =>
       val freed = orphans.map(delete).sum
-      println(green(s"\nFreed ${human(freed)}."))
+      println(green(s"\nFreed ${freed.pretty}."))
     case Mode.Interactive =>
-      var freed = 0L
+      var freed = Bytes.Zero
       var all = false
-      val it = orphans.iterator
       var quit = false
+      val it = orphans.iterator
       while it.hasNext && !quit do
         val o = it.next()
         val answer = if all then Answer.Yes else ask(o)
@@ -524,4 +615,4 @@ def ask(o: Orphan): Answer =
           case Answer.All  => all = true; freed += delete(o)
           case Answer.No   => ()
           case Answer.Quit => quit = true
-      println(green(s"\nFreed ${human(freed)}."))
+      println(green(s"\nFreed ${freed.pretty}."))
