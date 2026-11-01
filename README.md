@@ -11,7 +11,9 @@ backed up.
 
 - [scala-cli](https://scala-cli.virtuslab.org/install). It downloads Scala and the dependencies on the first run. The
   script uses your Java (`JAVA_HOME`, then `java` on `PATH`) if it is version 17 or newer and not a headless build. If
-  it is missing, older, or headless, scala-cli downloads JDK 21 once. If scala-cli is missing, the script prints the install link and exits. When it was not started from a
+  it is missing, older, or headless, scala-cli downloads JDK 21 once. When the script was not started from a terminal and takes
+  more than a second to start (the first run downloads and compiles), it shows a "Starting…" notification until the
+  program is up (`notify-send`, or a `zenity` progress window; a notification on macOS). If scala-cli is missing, the script prints the install link and exits. When it was not started from a
   terminal (for example by double-clicking it in a file manager), it shows the link in a dialog instead, using
   `kdialog`, `zenity`, `xmessage` or `notify-send`, whichever is available (`osascript` on macOS). Because desktop
   launchers often do not load your shell's `PATH`, the script also looks for scala-cli in the usual install locations

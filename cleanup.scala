@@ -4,21 +4,46 @@
 //sh for d in "$HOME/.local/share/coursier/bin" "$HOME/Library/Application Support/Coursier/bin" \
 //sh   "$HOME/.sdkman/candidates/scalacli/current/bin" "$HOME/.nix-profile/bin" "$HOME/.local/bin" \
 //sh   /opt/homebrew/bin /usr/local/bin; do PATH="$PATH:$d"; done
-//sh if command -v scala-cli >/dev/null 2>&1; then
+//sh has() { command -v "$1" >/dev/null 2>&1; }; title="Steam compatdata cleanup"
+//sh if has scala-cli; then
 //sh   # Use the system JDK (JAVA_HOME first, then PATH, like scala-cli) when it is Java 17+ with GUI support
 //sh   # (headless JDK packages lack libawt_xawt / libawt_lwawt). Otherwise let scala-cli fetch JDK 21 once.
 //sh   java="${JAVA_HOME:+$JAVA_HOME/bin/java}"; [ -x "${java:-}" ] || java=$(command -v java 2>/dev/null)
 //sh   props=$([ -n "$java" ] && "$java" -XshowSettings:properties -version 2>&1)
 //sh   ver=$(printf '%s\n' "$props" | sed -n 's/^ *java\.specification\.version = \([0-9]*\).*/\1/p')
 //sh   home=$(printf '%s\n' "$props" | sed -n 's/^ *java\.home = //p')
-//sh   if [ "${ver:-0}" -ge 17 ] 2>/dev/null && ls "$home"/lib/libawt_*awt.* >/dev/null 2>&1
-//sh   then exec scala-cli shebang "$0" "$@"; else exec scala-cli shebang --jvm 21 "$0" "$@"; fi
+//sh   jvm="--jvm 21"; [ "${ver:-0}" -ge 17 ] 2>/dev/null && ls "$home"/lib/libawt_*awt.* >/dev/null 2>&1 && jvm=
+//sh   # Outside a terminal scala-cli's download/compile progress is invisible, so if the program has not started
+//sh   # within a second, show a notification until it does. The program deletes $CLEANUP_STARTING_FILE on start.
+//sh   if [ ! -t 2 ] && CLEANUP_STARTING_FILE=$(mktemp 2>/dev/null); then
+//sh     export CLEANUP_STARTING_FILE; ready=$CLEANUP_STARTING_FILE; shell=$$
+//sh     (
+//sh       waiting() { [ -e "$ready" ] && kill -0 "$shell"; }
+//sh       sleep 1; waiting || { rm -f "$ready"; exit; }
+//sh       msg="Starting… The first run downloads Scala, the libraries and maybe Java, which can take a few minutes."
+//sh       if has notify-send && id=$(notify-send -p -t 0 -a "$title" -i system-software-update "$title" "$msg") \
+//sh         && [ -n "$id" ]; then
+//sh         while waiting; do sleep 1; done
+//sh         gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+//sh           --method org.freedesktop.Notifications.CloseNotification "$id" ||
+//sh           notify-send -r "$id" -t 1 -a "$title" "$title" "Started."
+//sh       elif has zenity; then
+//sh         zenity --progress --pulsate --no-cancel --title="$title" --text="$msg" & dialog=$!
+//sh         while waiting; do sleep 1; done; kill "$dialog"
+//sh       elif has osascript; then
+//sh         osascript -e "display notification \"$msg\" with title \"$title\""
+//sh         while waiting; do sleep 1; done
+//sh       fi
+//sh       rm -f "$ready"
+//sh     ) </dev/null >/dev/null 2>&1 &
+//sh   fi
+//sh   exec scala-cli shebang $jvm "$0" "$@"
 //sh fi
-//sh url=https://scala-cli.virtuslab.org/install; title="Steam compatdata cleanup"
+//sh url=https://scala-cli.virtuslab.org/install
 //sh msg="cleanup.scala needs scala-cli to run. Install it from $url and start the script again."
 //sh echo "$msg" >&2
 //sh if [ -t 2 ]; then [ -t 0 ] && printf "Press Enter to close." >&2 && read -r _; exit 127; fi
-//sh has() { command -v "$1" >/dev/null 2>&1; }; ask="Open install page"
+//sh ask="Open install page"
 //sh if has osascript; then
 //sh   osascript -e "display dialog \"$msg\" with title \"$title\" buttons {\"Close\", \"$ask\"} default button 2 with icon stop" \
 //sh     -e "if button returned of result is \"$ask\" then open location \"$url\"" >/dev/null 2>&1
@@ -1301,6 +1326,8 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
 // Main
 
 @main def run(rawArgs: String*): Unit =
+  // Tells the shell bootstrap that scala-cli is done preparing, which closes its "Starting…" notification.
+  sys.env.get("CLEANUP_STARTING_FILE").foreach(file => Try(Files.deleteIfExists(Paths.get(file))))
   val defaultSteamDir = SteamDir(Paths.get(sys.props("user.home"), ".local/share/Steam"))
   val args = parseArgs(rawArgs.toList, Args(defaultSteamDir, Mode.Gui, Theme.Auto))
 
