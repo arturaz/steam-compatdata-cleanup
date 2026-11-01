@@ -63,11 +63,10 @@
 //> using dep com.formdev:flatlaf:3.7.2
 //> using file src
 
+// --help prints the lines between the help markers (see `usage` in src/Args.scala), so keep them user-facing.
+// help:begin
 // Removes Proton prefixes (steamapps/compatdata/<appid>) and shader caches (steamapps/shadercache/<appid>)
 // for games that are no longer installed.
-//
-// Requires scala-cli (https://scala-cli.virtuslab.org/install); running without it shows that link (in a dialog
-// when not started from a terminal).
 //
 // Usage:
 //   ./cleanup.scala                  # GUI: pick games to delete (dry run in the terminal if there is no display)
@@ -79,8 +78,14 @@
 //   ./cleanup.scala --steam-dir /path/to/Steam
 //
 // An app is considered installed if any Steam library has steamapps/appmanifest_<appid>.acf.
+//
 // Non-Steam shortcuts (from userdata/*/config/shortcuts.vdf) and appid 0 are always kept.
+//
 // Game names and Steam Cloud rules come from Steam's local caches; no network access.
+// help:end
+
+// Requires scala-cli (https://scala-cli.virtuslab.org/install); running without it shows that link (in a dialog
+// when not started from a terminal).
 
 import java.awt.GraphicsEnvironment
 import java.nio.file.{Files, Paths}

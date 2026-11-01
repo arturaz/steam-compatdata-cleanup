@@ -1,4 +1,7 @@
-import java.nio.file.Paths
+import java.io.File
+import java.nio.file.{Files, Paths}
+import scala.jdk.CollectionConverters.*
+import scala.util.Try
 
 /** What to do in the terminal. */
 enum CliAction derives CanEqual:
@@ -18,12 +21,21 @@ enum Theme derives CanEqual:
 
 object Theme:
   def parse(s: String): Option[Theme] = values.find(_.toString.equalsIgnoreCase(s))
-  def names: String = values.map(_.toString.toLowerCase).mkString("|")
 
 case class Args(steamDir: SteamDir, mode: Mode, theme: Theme)
 
-val usage =
-  s"Usage: cleanup.scala [--cli | --delete | --interactive|-i] [--theme ${Theme.names}] [--steam-dir <path>]"
+/** The comment lines between `// help:begin` and `// help:end` in cleanup.scala, read from the source scala-cli
+  * reports.
+  */
+def usage: String =
+  val fromComment = for
+    sources <- sys.props.get("scala.sources")
+    script <- sources.split(File.pathSeparator).find(_.endsWith("cleanup.scala"))
+    lines <- Try(Files.readAllLines(Paths.get(script)).asScala.toList).toOption
+    (block, rest) = lines.dropWhile(_ != "// help:begin").drop(1).span(_ != "// help:end")
+    if block.nonEmpty && rest.nonEmpty
+  yield block.map(_.stripPrefix("//").stripPrefix(" ")).mkString("\n")
+  fromComment.getOrElse("See the comment at the top of cleanup.scala for usage.")
 
 def parseArgs(args: List[String], acc: Args): Args = args match
   case Nil                              => acc
@@ -38,7 +50,7 @@ def parseArgs(args: List[String], acc: Args): Args = args match
       case None =>
         System.err.println(s"Unknown theme: $name\n$usage")
         sys.exit(2)
-  case ("--help" | "-h") :: _ => println(usage); sys.exit(0)
+  case ("--help" | "-h") :: _ => println(s"\n$usage\n"); sys.exit(0)
   case other :: _ =>
     System.err.println(s"Unknown argument: $other\n$usage")
     sys.exit(2)
