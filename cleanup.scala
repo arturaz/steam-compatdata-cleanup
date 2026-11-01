@@ -4,7 +4,16 @@
 //sh for d in "$HOME/.local/share/coursier/bin" "$HOME/Library/Application Support/Coursier/bin" \
 //sh   "$HOME/.sdkman/candidates/scalacli/current/bin" "$HOME/.nix-profile/bin" "$HOME/.local/bin" \
 //sh   /opt/homebrew/bin /usr/local/bin; do PATH="$PATH:$d"; done
-//sh command -v scala-cli >/dev/null 2>&1 && exec scala-cli shebang "$0" "$@"
+//sh if command -v scala-cli >/dev/null 2>&1; then
+//sh   # Use the system JDK (JAVA_HOME first, then PATH, like scala-cli) when it is Java 17+ with GUI support
+//sh   # (headless JDK packages lack libawt_xawt / libawt_lwawt). Otherwise let scala-cli fetch JDK 21 once.
+//sh   java="${JAVA_HOME:+$JAVA_HOME/bin/java}"; [ -x "${java:-}" ] || java=$(command -v java 2>/dev/null)
+//sh   props=$([ -n "$java" ] && "$java" -XshowSettings:properties -version 2>&1)
+//sh   ver=$(printf '%s\n' "$props" | sed -n 's/^ *java\.specification\.version = \([0-9]*\).*/\1/p')
+//sh   home=$(printf '%s\n' "$props" | sed -n 's/^ *java\.home = //p')
+//sh   if [ "${ver:-0}" -ge 17 ] 2>/dev/null && ls "$home"/lib/libawt_*awt.* >/dev/null 2>&1
+//sh   then exec scala-cli shebang "$0" "$@"; else exec scala-cli shebang --jvm 21 "$0" "$@"; fi
+//sh fi
 //sh url=https://scala-cli.virtuslab.org/install; title="Steam compatdata cleanup"
 //sh msg="cleanup.scala needs scala-cli to run. Install it from $url and start the script again."
 //sh echo "$msg" >&2
