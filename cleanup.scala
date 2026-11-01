@@ -1,10 +1,12 @@
-#!/usr/bin/env -S scala-cli shebang
+#!/usr/bin/env -S sh -c 'command -v scala-cli >/dev/null||{ echo "cleanup.scala needs scala-cli: https://scala-cli.virtuslab.org/install">&2;exit 127;};exec scala-cli shebang "$0" "$@"'
 //> using scala 3.9.0
 //> using options -Wall -Werror -language:strictEquality
 //> using dep io.github.arturaz::yantl:0.4.3
 
 // Removes Proton prefixes (steamapps/compatdata/<appid>) and shader caches (steamapps/shadercache/<appid>)
 // for games that are no longer installed.
+//
+// Requires scala-cli (https://scala-cli.virtuslab.org/install); running without it prints that link.
 //
 // Usage:
 //   ./cleanup.scala                  # dry run: list what would be deleted
