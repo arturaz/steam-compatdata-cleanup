@@ -47,6 +47,8 @@ The **Kept** tab lists the installed games and non-Steam shortcuts that have a p
 These are never deleted, but they show where the rest of `compatdata` goes. For example, a launcher such as Battle.net
 added as a non-Steam shortcut installs its games inside its own prefix, which can take hundreds of gigabytes.
 
+![The Kept tab, with a Battle.net shortcut's prefix using 215.7 GiB](docs/kept.png)
+
 If there is no display (for example over SSH), the script prints a dry run in the terminal instead.
 
 `--theme` picks the starting look; the **Theme** dropdown in the window switches it live:

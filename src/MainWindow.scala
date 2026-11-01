@@ -136,6 +136,9 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
           row: Int,
           column: Int
       ): Component =
+        // setForeground also makes the colour the default for later unselected cells, so a colour set by `style`
+        // would carry over to the following rows. Clearing it makes the call below use the table's colour.
+        setForeground(null)
         val _ = super.getTableCellRendererComponent(table, value, selected, focused, row, column)
         setToolTipText(null)
         style(this, table.convertRowIndexToModel(row), selected)
@@ -196,7 +199,7 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
         s"<html>${escapeHtml(k.displayName)}&nbsp;&nbsp;<span style='color:${hex(palette.dimmed)}'>$note</span></html>"
       })
       label.setToolTipText(k.leftovers.map(l => s"${l.path.toString} (${l.size.pretty})").mkString("<html>", "<br>", "</html>"))
-      if k.name.isEmpty && !selected then label.setForeground(palette.dimmed)
+      if k.name.isEmpty && k.reason != KeepReason.AppZero && !selected then label.setForeground(palette.dimmed)
     })
     columns.getColumn(1).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, selected) =>
       if kept(row).reason == KeepReason.Installed && !selected then label.setForeground(palette.dimmed)
