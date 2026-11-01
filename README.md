@@ -5,6 +5,8 @@ When you uninstall a game, Steam on Linux leaves its Proton prefix (`steamapps/c
 games that are no longer installed and removes them. It also warns you about save files that Steam Cloud has not
 backed up.
 
+![The GUI listing leftovers of uninstalled games, with their save status](docs/screenshot.png)
+
 ## Requirements
 
 - [scala-cli](https://scala-cli.virtuslab.org/install). It downloads Scala, a JVM and the dependencies on the first
@@ -14,15 +16,38 @@ backed up.
 ## Usage
 
 ```sh
-./cleanup.scala                  # dry run: list what would be deleted
-./cleanup.scala --interactive    # ask per game, delete the ones you confirm (also -i)
-./cleanup.scala --delete         # delete everything listed, no questions
+./cleanup.scala                  # GUI: pick the games to delete
+./cleanup.scala --theme dark     # GUI look (see below)
+./cleanup.scala --cli            # dry run in the terminal: list what would be deleted
+./cleanup.scala --interactive    # terminal: ask per game, delete the ones you confirm (also -i)
+./cleanup.scala --delete         # terminal: delete everything listed, no questions
 ./cleanup.scala --steam-dir /path/to/Steam
 ```
 
-The script defaults to a dry run, so run it without arguments first and review the list.
+### GUI
 
-In interactive mode you answer `y` (delete), `N` (skip, default), `a` (delete this and all remaining) or `q` (quit).
+The GUI lists every uninstalled game with its leftover size and save status. Select a game to see its folders and
+saves below the list. Games whose saves are not backed up start unchecked. Check the games you want to remove (Space
+toggles the selected rows) and press **Delete selected…**. A confirmation lists any games whose saves would be lost.
+Double-click a game or a save to open its folder.
+
+If there is no display (for example over SSH), the script prints a dry run in the terminal instead.
+
+`--theme` picks the starting look; the **Theme** dropdown in the window switches it live:
+
+- `auto` (default): FlatLaf light or dark, following the desktop's dark mode. The script reads the freedesktop
+  appearance portal, then GNOME settings, then KDE's colour scheme, then `GTK_THEME`.
+- `light`, `dark`, `darcula`, `intellij`: FlatLaf themes.
+- `gtk`, `metal`, `nimbus`: the JDK's built-in looks.
+
+On tiling Wayland compositors such as Hyprland (including Omarchy), sway and niri, Java windows stay blank unless
+`_JAVA_AWT_WM_NONREPARENTING=1` is set. When the script detects one of these and the variable is not set, it restarts
+itself with the variable set.
+
+### Terminal
+
+`--cli` only lists what would be deleted, so run it first to review. In interactive mode you answer `y` (delete),
+`N` (skip, default), `a` (delete this and all remaining) or `q` (quit).
 
 ## What gets deleted
 
@@ -46,10 +71,10 @@ of three groups:
 - **☁ Saves backed up by Steam Cloud**: Steam restores them on reinstall.
 - **✓ No save data found**
 
-Interactive mode asks about the not-backed-up games first.
+The GUI lists the not-backed-up games first, and interactive mode asks about them first.
 
 Save detection is a heuristic. Games that keep saves elsewhere, for example in the install directory or under
-Steam's `userdata`, are not covered. Check the dry run before you delete.
+Steam's `userdata`, are not covered. Check the list before you delete.
 
 Game names and cloud information come from Steam's local caches (`appcache/appinfo.vdf`,
 `userdata/*/config/localconfig.vdf`). The script makes no network requests.

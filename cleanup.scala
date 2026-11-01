@@ -2,6 +2,7 @@
 //> using scala 3.9.0
 //> using options -Wall -Werror -language:strictEquality
 //> using dep io.github.arturaz::yantl:0.4.3
+//> using dep com.formdev:flatlaf:3.7.2
 
 // Removes Proton prefixes (steamapps/compatdata/<appid>) and shader caches (steamapps/shadercache/<appid>)
 // for games that are no longer installed.
@@ -9,21 +10,36 @@
 // Requires scala-cli (https://scala-cli.virtuslab.org/install); running without it prints that link.
 //
 // Usage:
-//   ./cleanup.scala                  # dry run: list what would be deleted
-//   ./cleanup.scala --interactive    # ask per game, delete the ones you confirm
-//   ./cleanup.scala --delete         # delete everything listed, no questions
+//   ./cleanup.scala                  # GUI: pick games to delete (dry run in the terminal if there is no display)
+//   ./cleanup.scala --theme dark     # GUI look: auto (default, follows the desktop), light, dark, darcula, intellij,
+//                                    #   gtk, metal, nimbus
+//   ./cleanup.scala --cli            # dry run in the terminal: list what would be deleted
+//   ./cleanup.scala --interactive    # terminal: ask per game, delete the ones you confirm
+//   ./cleanup.scala --delete         # terminal: delete everything listed, no questions
 //   ./cleanup.scala --steam-dir /path/to/Steam
 //
 // An app is considered installed if any Steam library has steamapps/appmanifest_<appid>.acf.
 // Non-Steam shortcuts (from userdata/*/config/shortcuts.vdf) and appid 0 are always kept.
 // Game names and Steam Cloud rules come from Steam's local caches; no network access.
 
+import java.awt.{BorderLayout, Color, Component, FlowLayout, Font, GraphicsEnvironment}
+import java.awt.event.{ActionEvent, MouseAdapter, MouseEvent}
+import java.lang.management.ManagementFactory
 import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.TimeUnit
+import javax.swing.{AbstractAction, BorderFactory, BoxLayout, JButton, JComboBox, JComponent, JFrame, JLabel, JOptionPane, JPanel,
+  JProgressBar, JScrollPane, JSplitPane, JTable, KeyStroke, SwingConstants, SwingUtilities, UIManager, WindowConstants}
+import javax.swing.plaf.FontUIResource
+import javax.swing.table.{AbstractTableModel, DefaultTableCellRenderer}
+import javax.swing.text.StyleContext
+import com.formdev.flatlaf.{FlatDarculaLaf, FlatDarkLaf, FlatIntelliJLaf, FlatLightLaf}
+import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters.*
-import scala.util.{Try, Using}
+import scala.jdk.OptionConverters.*
+import scala.util.{Failure, Success, Try, Using}
 import yantl.*
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -96,30 +112,56 @@ object LibraryDir extends Newtype.WithoutValidationOf[Path]:
 type LibraryDir = LibraryDir.Type
 
 /** Kinds of per-app data Steam leaves behind after uninstalling. */
-enum LeftoverKind(val dirName: String) derives CanEqual:
+enum LeftoverKind(val dirName: String, val label: String) derives CanEqual:
   /** Proton/Wine prefix: steamapps/compatdata/<appid>. */
-  case Prefix extends LeftoverKind("compatdata")
+  case Prefix extends LeftoverKind("compatdata", "Proton prefix")
   /** Compiled shader cache: steamapps/shadercache/<appid>. */
-  case ShaderCache extends LeftoverKind("shadercache")
+  case ShaderCache extends LeftoverKind("shadercache", "Shader cache")
 
 case class Leftover(kind: LeftoverKind, path: Path, size: Bytes)
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Arguments
 
-enum Mode derives CanEqual:
+/** What to do in the terminal. */
+enum CliAction derives CanEqual:
   case DryRun, Delete, Interactive
 
-case class Args(steamDir: SteamDir, mode: Mode)
+enum Mode derives CanEqual:
+  case Gui
+  case Cli(action: CliAction)
 
-val usage = "Usage: cleanup.scala [--delete | --interactive|-i] [--steam-dir <path>]"
+/** Swing look and feel. */
+enum Theme derives CanEqual:
+  /** FlatLaf light or dark, following the desktop's dark mode setting. */
+  case Auto
+  case Light, Dark, Darcula, IntelliJ
+  // The JDK's built-in looks; Gtk is the JDK's "system" look on Linux.
+  case Gtk, Metal, Nimbus
+
+object Theme:
+  def parse(s: String): Option[Theme] = values.find(_.toString.equalsIgnoreCase(s))
+  def names: String = values.map(_.toString.toLowerCase).mkString("|")
+
+case class Args(steamDir: SteamDir, mode: Mode, theme: Theme)
+
+val usage =
+  s"Usage: cleanup.scala [--cli | --delete | --interactive|-i] [--theme ${Theme.names}] [--steam-dir <path>]"
 
 def parseArgs(args: List[String], acc: Args): Args = args match
   case Nil                              => acc
-  case "--delete" :: rest               => parseArgs(rest, acc.copy(mode = Mode.Delete))
-  case ("--interactive" | "-i") :: rest => parseArgs(rest, acc.copy(mode = Mode.Interactive))
+  case "--gui" :: rest                  => parseArgs(rest, acc.copy(mode = Mode.Gui))
+  case "--cli" :: rest                  => parseArgs(rest, acc.copy(mode = Mode.Cli(CliAction.DryRun)))
+  case "--delete" :: rest               => parseArgs(rest, acc.copy(mode = Mode.Cli(CliAction.Delete)))
+  case ("--interactive" | "-i") :: rest => parseArgs(rest, acc.copy(mode = Mode.Cli(CliAction.Interactive)))
   case "--steam-dir" :: dir :: rest     => parseArgs(rest, acc.copy(steamDir = SteamDir(Paths.get(dir))))
-  case ("--help" | "-h") :: _           => println(usage); sys.exit(0)
+  case "--theme" :: name :: rest =>
+    Theme.parse(name) match
+      case Some(theme) => parseArgs(rest, acc.copy(theme = theme))
+      case None =>
+        System.err.println(s"Unknown theme: $name\n$usage")
+        sys.exit(2)
+  case ("--help" | "-h") :: _ => println(usage); sys.exit(0)
   case other :: _ =>
     System.err.println(s"Unknown argument: $other\n$usage")
     sys.exit(2)
@@ -157,6 +199,14 @@ def deleteTree(dir: Path): Unit =
         Files.delete(d)
         FileVisitResult.CONTINUE
   )
+
+/** Runs a command and returns its trimmed output, or None if it is missing, fails or takes too long. */
+def commandOutput(command: String*): Option[String] =
+  Try {
+    val process = ProcessBuilder(command*).redirectErrorStream(true).start()
+    val output = String(process.getInputStream.readAllBytes, StandardCharsets.UTF_8)
+    if process.waitFor(3, TimeUnit.SECONDS) && process.exitValue == 0 then Some(output.trim) else None
+  }.toOption.flatten
 
 // ---------------------------------------------------------------------------------------------------------------------
 // VDF (Valve KeyValues) parsing.
@@ -411,8 +461,24 @@ enum Cloud derives CanEqual:
   /** The game does not use Steam Cloud at all. */
   case NoCloud
 
+  def label: String = this match
+    case Synced             => "☁ in Steam Cloud"
+    case Unconfirmed(state) => s"☁ Steam Cloud, last sync: ${state.fold("unknown")(_.unwrap)}"
+    case NotCovered         => "✗ not synced by Steam Cloud"
+    case NoCloud            => "✗ game has no Steam Cloud"
+
+  def risk: Risk = this match
+    case Synced         => Risk.Safe
+    case Unconfirmed(_) => Risk.Unsure
+    case NotCovered     => Risk.Lost
+    case NoCloud        => Risk.Lost
+
+/** How likely deleting something loses saves, from least to most. */
+enum Risk derives CanEqual:
+  case NoSaves, Safe, Unsure, Lost
+
 /** A non-empty, game-created file or folder in one of a prefix's save folders. */
-case class Save(folder: UserFolder, entry: EntryName, size: Bytes, cloud: Cloud):
+case class Save(folder: UserFolder, entry: EntryName, fullPath: Path, size: Bytes, cloud: Cloud):
   def path: String = s"$folder/$entry"
 
 /** Non-empty, game-created entries in the usual save locations of a prefix. */
@@ -425,7 +491,7 @@ def likelySaves(prefix: Path, cloud: (UserFolder, EntryName) => Cloud): List[Sav
     if !Files.isSymbolicLink(path) && !notSaves.contains(entry)
     size = treeSize(path)
     if !size.isZero
-  yield Save(folder, entry, size, cloud(folder, entry))
+  yield Save(folder, entry, path, size, cloud(folder, entry))
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Steam Cloud
@@ -476,7 +542,81 @@ def cloudStatus(info: Option[Vdf.BinaryBlock], syncStates: Map[AppId, List[SyncS
         if states.contains(SyncState.Synchronized) then Cloud.Synced else Cloud.Unconfirmed(states.headOption)
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Output
+// Scanning
+
+/** The three groups games are shown in, in display order. */
+enum SaveGroup derives CanEqual:
+  /** Has saves that Steam Cloud does not verifiably hold: deleting may lose them for good. */
+  case NotBackedUp
+  /** All saves are in Steam Cloud. */
+  case BackedUp
+  case NoSaves
+
+case class Orphan(appId: AppId, name: Option[GameName], leftovers: List[Leftover], saves: List[Save]):
+  def size: Bytes = leftovers.map(_.size).sum
+  def backedUp: Boolean = saves.nonEmpty && saves.forall(_.cloud == Cloud.Synced)
+  def group: SaveGroup =
+    if saves.isEmpty then SaveGroup.NoSaves else if backedUp then SaveGroup.BackedUp else SaveGroup.NotBackedUp
+  /** The riskiest of the game's saves. */
+  def risk: Risk = saves.map(_.cloud.risk).maxByOption(_.ordinal).getOrElse(Risk.NoSaves)
+  def displayName: String = name.fold(s"Unknown app $appId")(_.unwrap)
+  private def has(kind: LeftoverKind) = leftovers.exists(_.kind == kind)
+  /** Extra note when leftovers aren't just a Proton prefix. */
+  def kindNote: Option[String] = (has(LeftoverKind.Prefix), has(LeftoverKind.ShaderCache)) match
+    case (true, true)  => Some("prefix + shader cache")
+    case (false, true) => Some("shader cache only")
+    case _             => None
+
+def totalSize(os: Iterable[Orphan]): Bytes = os.map(_.size).sum
+
+case class Scan(libraries: List[LibraryDir], installedCount: Int, shortcutCount: Int, orphans: List[Orphan])
+
+/** Finds leftovers of uninstalled games, ordered by group, then largest first. Left is a reason to stop. */
+def scan(steamDir: SteamDir): Either[String, Scan] =
+  val libraries = libraryDirs(steamDir)
+  if libraries.isEmpty then return Left(s"No Steam libraries found under ${steamDir.unwrap.toString}")
+  val installed = installedAppIds(libraries)
+  if installed.isEmpty then return Left("No appmanifests found — refusing to continue (would delete everything).")
+  val shortcuts = shortcutAppIds(steamDir)
+  val keep = installed ++ shortcuts + AppId.Zero
+
+  val orphanDirs: Map[AppId, List[(LeftoverKind, Path)]] =
+    (for
+      lib   <- libraries
+      kind  <- LeftoverKind.values.toList
+      dir   <- listDir(lib.leftovers(kind))
+      if Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)
+      appId <- AppId.parse(dir.getFileName.toString)
+      if !keep.contains(appId)
+    yield appId -> (kind, dir)).groupMap(_._1)(_._2)
+
+  val infos = appInfos(steamDir, orphanDirs.keySet)
+  val syncStates = if orphanDirs.isEmpty then Map.empty else cloudSyncStates(steamDir)
+  val orphans = orphanDirs.toList
+    .map { (appId, dirs) =>
+      val info = infos.get(appId)
+      val saves = dirs.collect { case (LeftoverKind.Prefix, dir) => dir }
+        .flatMap(likelySaves(_, cloudStatus(info, syncStates, appId)))
+      val leftovers = dirs.map((kind, dir) => Leftover(kind, dir, treeSize(dir)))
+      Orphan(appId, info.flatMap(gameName), leftovers, saves)
+    }
+    .sortBy(o => (o.group.ordinal, -o.size.unwrap, o.appId))
+  Right(Scan(libraries, installed.size, shortcuts.size, orphans))
+
+/** Deletes a game's leftovers, returning the error for each one that could not be deleted. */
+def deleteLeftovers(o: Orphan): List[(Leftover, Option[Exception])] =
+  o.leftovers.map { l =>
+    l -> (try
+      deleteTree(l.path)
+      None
+    catch case e: Exception => Some(e))
+  }
+
+def plural(n: Int, word: String): String = s"$n $word${if n == 1 then "" else "s"}"
+def gameCount(n: Int): String = plural(n, "game")
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Terminal output
 
 /** ANSI styling, disabled when stdout is not a terminal or NO_COLOR is set. */
 object Style:
@@ -504,19 +644,6 @@ def displayWidth(s: String): Int =
 def padLeft(s: String, w: Int): String = " " * (w - displayWidth(s)).max(0) + s
 def padRight(s: String, w: Int): String = s + " " * (w - displayWidth(s)).max(0)
 
-case class Orphan(appId: AppId, name: Option[GameName], leftovers: List[Leftover], saves: List[Save]):
-  def size: Bytes = leftovers.map(_.size).sum
-  def backedUp: Boolean = saves.nonEmpty && saves.forall(_.cloud == Cloud.Synced)
-  def displayName: String = name.fold(s"Unknown app $appId")(_.unwrap)
-  private def has(kind: LeftoverKind) = leftovers.exists(_.kind == kind)
-  /** Extra note when leftovers aren't just a Proton prefix. */
-  def kindNote: Option[String] = (has(LeftoverKind.Prefix), has(LeftoverKind.ShaderCache)) match
-    case (true, true)  => Some("prefix + shader cache")
-    case (false, true) => Some("shader cache only")
-    case _             => None
-
-def totalSize(os: List[Orphan]): Bytes = os.map(_.size).sum
-
 val sizeW = 10
 
 /** Prints one section of games with a heading; `nameW` keeps size columns aligned across sections. */
@@ -530,26 +657,21 @@ def printSection(heading: String, games: List[Orphan], nameW: Int): Unit =
     println(s"    ${padRight(name, nameW)}  ${padLeft(size, sizeW)}  ${dim(s"#${o.appId}")}$note")
     o.saves.zipWithIndex.foreach { (save, i) =>
       val branch = if i == o.saves.length - 1 then "└─" else "├─"
-      val (color, status) = save.cloud match
-        case Cloud.Synced             => (green, "☁ in Steam Cloud")
-        case Cloud.Unconfirmed(state) => (yellow, s"☁ Steam Cloud, last sync: ${state.fold("unknown")(_.unwrap)}")
-        case Cloud.NotCovered         => (red, "✗ not synced by Steam Cloud")
-        case Cloud.NoCloud            => (red, "✗ game has no Steam Cloud")
-      println(s"      ${padRight(s"$branch ${save.path}", nameW - 2)}  ${padLeft(save.size.pretty, sizeW)}  ${color(status)}")
+      val color = save.cloud.risk match
+        case Risk.Safe                 => green
+        case Risk.Unsure               => yellow
+        case Risk.Lost | Risk.NoSaves  => red
+      println(s"      ${padRight(s"$branch ${save.path}", nameW - 2)}  ${padLeft(save.size.pretty, sizeW)}  ${color(save.cloud.label)}")
     }
   }
   println()
 
-// ---------------------------------------------------------------------------------------------------------------------
-// Deletion
-
 def delete(o: Orphan): Bytes =
-  o.leftovers.map { l =>
-    try
-      deleteTree(l.path)
+  deleteLeftovers(o).map {
+    case (l, None) =>
       println(s"    ${green("✓")} deleted ${dim(l.path.toString)}")
       l.size
-    catch case e: Exception =>
+    case (l, Some(e)) =>
       System.err.println(s"    ${red("✗")} failed to delete ${l.path.toString}: ${e.getMessage}")
       Bytes.Zero
   }.sum
@@ -571,67 +693,32 @@ def ask(o: Orphan): Answer =
     case Some("q" | "quit") => Answer.Quit
     case Some(_)            => Answer.No
 
-// ---------------------------------------------------------------------------------------------------------------------
-// Main
+def runCli(steamDir: SteamDir, action: CliAction): Unit =
+  val result = scan(steamDir) match
+    case Left(error) =>
+      System.err.println(error)
+      sys.exit(1)
+    case Right(result) => result
+  println(dim(s"Steam libraries: ${result.libraries.mkString(", ")}"))
+  println(dim(s"Keeping ${plural(result.installedCount, "installed app")} and " +
+    s"${plural(result.shortcutCount, "non-Steam shortcut")}."))
 
-@main def run(rawArgs: String*): Unit =
-  val defaultSteamDir = SteamDir(Paths.get(sys.props("user.home"), ".local/share/Steam"))
-  val args = parseArgs(rawArgs.toList, Args(defaultSteamDir, Mode.DryRun))
-
-  val libraries = libraryDirs(args.steamDir)
-  if libraries.isEmpty then
-    System.err.println(s"No Steam libraries found under ${args.steamDir.unwrap.toString}")
-    sys.exit(1)
-
-  val installed = installedAppIds(libraries)
-  val shortcuts = shortcutAppIds(args.steamDir)
-  val keep = installed ++ shortcuts + AppId.Zero
-
-  def plural(n: Int, word: String) = s"$n $word${if n == 1 then "" else "s"}"
-  println(dim(s"Steam libraries: ${libraries.mkString(", ")}"))
-  println(dim(s"Keeping ${plural(installed.size, "installed app")} and ${plural(shortcuts.size, "non-Steam shortcut")}."))
-  if installed.isEmpty then
-    System.err.println("No appmanifests found — refusing to continue (would delete everything).")
-    sys.exit(1)
-
-  val orphanDirs: Map[AppId, List[(LeftoverKind, Path)]] =
-    (for
-      lib   <- libraries
-      kind  <- LeftoverKind.values.toList
-      dir   <- listDir(lib.leftovers(kind))
-      if Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)
-      appId <- AppId.parse(dir.getFileName.toString)
-      if !keep.contains(appId)
-    yield appId -> (kind, dir)).groupMap(_._1)(_._2)
-
-  if orphanDirs.isEmpty then
+  val orphans = result.orphans // display order = interactive order
+  if orphans.isEmpty then
     println(green("\nNothing to clean up."))
     return
 
-  val infos = appInfos(args.steamDir, orphanDirs.keySet)
-  val syncStates = cloudSyncStates(args.steamDir)
-  val all = orphanDirs.toList
-    .map { (appId, dirs) =>
-      val info = infos.get(appId)
-      val saves = dirs.collect { case (LeftoverKind.Prefix, dir) => dir }
-        .flatMap(likelySaves(_, cloudStatus(info, syncStates, appId)))
-      val leftovers = dirs.map((kind, dir) => Leftover(kind, dir, treeSize(dir)))
-      Orphan(appId, info.flatMap(gameName), leftovers, saves)
-    }
-    .sortBy(o => (-o.size.unwrap, o.appId)) // largest first
-  val notBackedUp = all.filter(o => o.saves.nonEmpty && !o.backedUp)
-  val backedUp = all.filter(_.backedUp)
-  val noSaves = all.filter(_.saves.isEmpty)
-  val orphans = notBackedUp ++ backedUp ++ noSaves // display order = interactive order
-
-  def games(n: Int) = plural(n, "game")
-  def summary(os: List[Orphan]) = s"${games(os.size)}, ${totalSize(os).pretty}"
+  def inGroup(g: SaveGroup) = orphans.filter(_.group == g)
+  val notBackedUp = inGroup(SaveGroup.NotBackedUp)
+  val backedUp = inGroup(SaveGroup.BackedUp)
+  val noSaves = inGroup(SaveGroup.NoSaves)
+  def summary(os: List[Orphan]) = s"${gameCount(os.size)}, ${totalSize(os).pretty}"
 
   val nameW = (orphans.map(o => displayWidth(o.displayName)) ++
     orphans.flatMap(_.saves.map(s => displayWidth(s.path) + 5))).max.min(60)
 
   println()
-  println(bold(s"Uninstalled games are using ${totalSize(orphans).pretty}") + dim(s" (${games(orphans.size)})"))
+  println(bold(s"Uninstalled games are using ${totalSize(orphans).pretty}") + dim(s" (${gameCount(orphans.size)})"))
   println()
   printSection(
     red(bold("✗ Saves not backed up")) + dim(s" (${summary(notBackedUp)}) — deleting loses them for good"),
@@ -645,14 +732,14 @@ def ask(o: Orphan): Answer =
   )
   printSection(green(bold("✓ No save data found")) + dim(s" (${summary(noSaves)})"), noSaves, nameW)
 
-  args.mode match
-    case Mode.DryRun =>
+  action match
+    case CliAction.DryRun =>
       println(s"${cyan("Dry run")} — nothing deleted. Use ${bold("--interactive")} to choose per game, " +
         s"or ${bold("--delete")} to remove all.")
-    case Mode.Delete =>
+    case CliAction.Delete =>
       val freed = orphans.map(delete).sum
       println(green(s"\nFreed ${freed.pretty}."))
-    case Mode.Interactive =>
+    case CliAction.Interactive =>
       var freed = Bytes.Zero
       var all = false
       var quit = false
@@ -666,3 +753,527 @@ def ask(o: Orphan): Answer =
           case Answer.No   => ()
           case Answer.Quit => quit = true
       println(green(s"\nFreed ${freed.pretty}."))
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Desktop integration
+
+/** Whether the desktop asks for dark mode. Tries, in order: the freedesktop appearance portal (GNOME, KDE, and
+  * Hyprland/sway with xdg-desktop-portal-gtk), GNOME settings, KDE's colour scheme, the GTK_THEME variable.
+  */
+object DesktopDarkMode:
+  /** Portal values: 1 = prefer dark, 2 = prefer light, 0 = no preference. */
+  private def portal: Option[Boolean] =
+    commandOutput("gdbus", "call", "--session", "--timeout", "2", "--dest", "org.freedesktop.portal.Desktop",
+      "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.portal.Settings.ReadOne",
+      "org.freedesktop.appearance", "color-scheme")
+      .flatMap("""uint32 (\d)""".r.findFirstMatchIn(_))
+      .map(_.group(1))
+      .collect { case "1" => true; case "2" => false }
+
+  private def gsettings(key: String): Option[String] =
+    commandOutput("gsettings", "get", "org.gnome.desktop.interface", key)
+
+  private def gnome: Option[Boolean] =
+    gsettings("color-scheme")
+      .collect { case s if s.contains("prefer-dark") => true; case s if s.contains("prefer-light") => false }
+      .orElse(gsettings("gtk-theme").filter(_.toLowerCase.contains("dark")).map(_ => true))
+
+  /** KDE writes its window background colour to kdeglobals. */
+  private def kde: Option[Boolean] =
+    val isKde = sys.env.get("XDG_CURRENT_DESKTOP").exists(_.split(':').contains("KDE"))
+    val config = sys.env.get("XDG_CONFIG_HOME").map(Paths.get(_)).getOrElse(Paths.get(sys.props("user.home"), ".config"))
+    if !isKde then None
+    else
+      Try(Files.readAllLines(config.resolve("kdeglobals")).asScala.toList).toOption.flatMap { lines =>
+        lines
+          .dropWhile(_.trim != "[Colors:Window]").drop(1).takeWhile(!_.startsWith("["))
+          .collectFirst { case l if l.startsWith("BackgroundNormal=") => l.stripPrefix("BackgroundNormal=") }
+          .map(_.split(',').toList.flatMap(_.trim.toIntOption))
+          .collect { case List(r, g, b) => luminance(Color(r, g, b)) < 0.5 }
+      }
+
+  private def gtkThemeVariable: Option[Boolean] =
+    sys.env.get("GTK_THEME").filter(_.toLowerCase.contains("dark")).map(_ => true)
+
+  def prefersDark: Boolean = portal.orElse(gnome).orElse(kde).orElse(gtkThemeVariable).getOrElse(false)
+
+/** Relative luminance from 0 (black) to 1 (white). */
+def luminance(c: Color): Double = (0.2126 * c.getRed + 0.7152 * c.getGreen + 0.0722 * c.getBlue) / 255
+
+/** Java's X11 toolkit shows blank grey windows under tiling compositors (Hyprland, sway, niri, ...) unless it is told
+  * that the window manager does not reparent. That is read from an environment variable when the JVM starts.
+  */
+def needsNonReparentingRelaunch: Boolean =
+  val tilingSockets = List("HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "NIRI_SOCKET")
+  val tilingDesktops = Set("hyprland", "sway", "niri", "river", "wayfire", "labwc", "dwl", "qtile", "i3", "bspwm")
+  val desktops = sys.env.get("XDG_CURRENT_DESKTOP").toList.flatMap(_.toLowerCase.split(':'))
+  !sys.env.contains("_JAVA_AWT_WM_NONREPARENTING") &&
+  (tilingSockets.exists(sys.env.contains) || desktops.exists(tilingDesktops.contains))
+
+/** Starts this program again in a new JVM with _JAVA_AWT_WM_NONREPARENTING=1 and exits with its exit code.
+  * Returns false (doing nothing) if the current command line can't be reconstructed.
+  */
+def relaunchNonReparenting(rawArgs: Seq[String]): Boolean =
+  val command =
+    for
+      java      <- ProcessHandle.current.info.command.toScala
+      mainClass <- sys.props.get("sun.java.command").flatMap(_.split(' ').headOption)
+      classPath <- sys.props.get("java.class.path")
+      if !mainClass.endsWith(".jar")
+    yield (java :: ManagementFactory.getRuntimeMXBean.getInputArguments.asScala.toList) ++
+      List("-cp", classPath, mainClass) ++ rawArgs
+  command.exists { command =>
+    val builder = ProcessBuilder(command.asJava).inheritIO()
+    val _ = builder.environment.put("_JAVA_AWT_WM_NONREPARENTING", "1")
+    sys.exit(builder.start().waitFor())
+  }
+
+/** Shows a file or folder in the desktop's file manager (a file is shown by opening its folder). */
+def openInFileManager(path: Path): Try[Unit] =
+  val target = if Files.isDirectory(path) then path else path.getParent
+  Try { val _ = ProcessBuilder("xdg-open", target.toString).start() }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// GUI
+
+object Gui:
+  def start(steamDir: SteamDir, theme: Theme): Unit =
+    // Runs commands, so do it before touching the event thread.
+    val dark = theme == Theme.Auto && DesktopDarkMode.prefersDark
+    SwingUtilities.invokeLater { () =>
+      applyTheme(theme, autoDark = dark)
+      MainWindow(steamDir, theme).show()
+    }
+
+  /** Sets the look and feel. Windows that already exist need SwingUtilities.updateComponentTreeUI afterwards. */
+  def applyTheme(theme: Theme, autoDark: Boolean): Unit =
+    def laf(className: String) = Try(UIManager.setLookAndFeel(className)).isSuccess
+    val _ = theme match
+      case Theme.Auto     => if autoDark then FlatDarkLaf.setup() else FlatLightLaf.setup()
+      case Theme.Light    => FlatLightLaf.setup()
+      case Theme.Dark     => FlatDarkLaf.setup()
+      case Theme.Darcula  => FlatDarculaLaf.setup()
+      case Theme.IntelliJ => FlatIntelliJLaf.setup()
+      case Theme.Gtk      => laf("com.sun.java.swing.plaf.gtk.GTKLookAndFeel")
+      case Theme.Metal    => laf("javax.swing.plaf.metal.MetalLookAndFeel")
+      case Theme.Nimbus   => laf("javax.swing.plaf.nimbus.NimbusLookAndFeel")
+    // FlatLaf uses the desktop font as is, which has no glyphs for e.g. CJK game names. A composite font falls back to
+    // other installed fonts for those.
+    Option(UIManager.getFont("defaultFont")).foreach { font =>
+      val composite = StyleContext.getDefaultStyleContext.getFont(font.getFamily, font.getStyle, font.getSize)
+      val _ = UIManager.put("defaultFont", FontUIResource(composite))
+    }
+
+/** Runs `work` off the event thread, then `onDone` on it. */
+def inBackground[A](work: => A)(onDone: Try[A] => Unit): Unit =
+  Thread(() => {
+    val result = Try(work)
+    SwingUtilities.invokeLater(() => onDone(result))
+  }).start()
+
+def escapeHtml(s: String): String = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def hex(c: Color): String = f"#${c.getRGB & 0xffffff}%06x"
+
+/** A game in the list. `orphan` loses the leftovers that get deleted, keeping the ones that failed. */
+final class GameRow(var orphan: Orphan, var checked: Boolean)
+
+/** A leftover folder or a save shown in the details table. */
+final case class Detail(kind: String, location: String, path: Path, size: Bytes, cloud: Option[Cloud])
+
+/** Text colours that suit the current look and feel's background. */
+final case class Palette(red: Color, green: Color, yellow: Color, dimmed: Color)
+
+object Palette:
+  def current(): Palette =
+    val dark = luminance(UIManager.getColor("Panel.background")) < 0.5
+    Palette(
+      red = if dark then Color(0xff6b68) else Color(0xc62828),
+      green = if dark then Color(0x6cc470) else Color(0x2e7d32),
+      yellow = if dark then Color(0xe5c07b) else Color(0x9a6700),
+      dimmed = Option(UIManager.getColor("Label.disabledForeground")).getOrElse(Color.GRAY)
+    )
+
+final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
+  private var palette = Palette.current()
+
+  private def riskColor(risk: Risk): Color = risk match
+    case Risk.NoSaves => palette.dimmed
+    case Risk.Safe    => palette.green
+    case Risk.Unsure  => palette.yellow
+    case Risk.Lost    => palette.red
+
+  private def riskSummary(risk: Risk): String = risk match
+    case Risk.NoSaves => "no saves found"
+    case Risk.Safe    => "☁ saves in Steam Cloud"
+    case Risk.Unsure  => "☁ cloud sync unconfirmed"
+    case Risk.Lost    => "✗ saves not backed up"
+
+  private val frame = JFrame("Steam leftovers cleanup")
+  private val rows = ArrayBuffer.empty[GameRow]
+  private var details = Vector.empty[Detail]
+  private var scanned: Option[Scan] = None
+  private var freed = Bytes.Zero
+  private var busy = false
+
+  private object gameModel extends AbstractTableModel:
+    private val columns = Vector("", "Game", "Size", "Saves", "App ID")
+    def getRowCount: Int = rows.size
+    def getColumnCount: Int = columns.size
+    override def getColumnName(column: Int): String = columns(column)
+    override def getColumnClass(column: Int): Class[?] = column match
+      case 0 => classOf[java.lang.Boolean]
+      case 1 => classOf[String]
+      case 3 => classOf[java.lang.Integer]
+      case _ => classOf[java.lang.Long]
+    override def isCellEditable(row: Int, column: Int): Boolean = column == 0 && !busy
+    def getValueAt(row: Int, column: Int): Object =
+      val o = rows(row).orphan
+      column match
+        case 0 => java.lang.Boolean.valueOf(rows(row).checked)
+        case 1 => o.displayName
+        case 2 => java.lang.Long.valueOf(o.size.unwrap)
+        case 3 => java.lang.Integer.valueOf(o.risk.ordinal)
+        case _ => java.lang.Long.valueOf(o.appId.unwrap)
+    override def setValueAt(value: Object, row: Int, column: Int): Unit = value match
+      case checked: java.lang.Boolean if column == 0 =>
+        rows(row).checked = checked
+        fireTableCellUpdated(row, column)
+        refresh()
+      case _ => ()
+
+  private object detailModel extends AbstractTableModel:
+    private val columns = Vector("Type", "Location", "Size", "Steam Cloud")
+    def getRowCount: Int = details.size
+    def getColumnCount: Int = columns.size
+    override def getColumnName(column: Int): String = columns(column)
+    def getValueAt(row: Int, column: Int): Object =
+      val d = details(row)
+      column match
+        case 0 => d.kind
+        case 1 => d.location
+        case 2 => d.size.pretty
+        case _ => d.cloud.fold("")(_.label)
+
+  // Lazy: the models refer to this window, so they can only be handed out once it is constructed.
+  private lazy val gameTable = JTable(gameModel)
+  private lazy val detailTable = JTable(detailModel)
+  private val title = JLabel("Scanning Steam libraries…")
+  private val subtitle = JLabel(" ")
+  private val status = JLabel(" ")
+  private val progress = JProgressBar()
+  private val selectSafeButton = JButton("Select safe")
+  private val selectAllButton = JButton("Select all")
+  private val selectNoneButton = JButton("Select none")
+  private val openButton = JButton("Open folder")
+  private val deleteButton = JButton("Delete selected…")
+  private val themeBox = JComboBox[Theme](Theme.values)
+  private val detailTitle = JLabel("Details of the selected game")
+  private val dimLabels = ArrayBuffer[JLabel](subtitle)
+
+  /** Fonts and colours set by hand; redone after a theme switch, since they don't come from the look and feel. */
+  private def styleLabels(): Unit =
+    val base = UIManager.getFont("Label.font")
+    title.setFont(base.deriveFont(Font.BOLD, base.getSize2D * 1.5f))
+    detailTitle.setFont(base.deriveFont(Font.BOLD))
+    dimLabels.foreach(_.setForeground(palette.dimmed))
+
+  private def switchTheme(): Unit =
+    themeBox.getItemAt(themeBox.getSelectedIndex) match
+      case null => ()
+      case theme =>
+        // Auto runs commands to read the desktop setting, so do that off the event thread.
+        inBackground(theme == Theme.Auto && DesktopDarkMode.prefersDark) { dark =>
+          Gui.applyTheme(theme, autoDark = dark.getOrElse(false))
+          palette = Palette.current()
+          SwingUtilities.updateComponentTreeUI(frame)
+          styleLabels()
+          frame.repaint()
+        }
+
+  /** A cell renderer that lets `style` adjust the label for the row (as a model index). */
+  private def renderer(align: Int)(style: (JLabel, Int, Boolean) => Unit): DefaultTableCellRenderer =
+    new DefaultTableCellRenderer:
+      setHorizontalAlignment(align)
+      override def getTableCellRendererComponent(
+          table: JTable,
+          value: Object,
+          selected: Boolean,
+          focused: Boolean,
+          row: Int,
+          column: Int
+      ): Component =
+        val _ = super.getTableCellRendererComponent(table, value, selected, focused, row, column)
+        setToolTipText(null)
+        style(this, table.convertRowIndexToModel(row), selected)
+        this
+
+  private def setupGameTable(): Unit =
+    gameTable.setAutoCreateRowSorter(true)
+    gameTable.setFillsViewportHeight(true)
+    gameTable.setShowGrid(false)
+    gameTable.setRowHeight((gameTable.getRowHeight * 1.4).toInt)
+    val columns = gameTable.getColumnModel
+    columns.getColumn(0).setMaxWidth(36)
+    List(1 -> 380, 2 -> 90, 3 -> 220, 4 -> 90).foreach((i, w) => columns.getColumn(i).setPreferredWidth(w))
+
+    columns.getColumn(1).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, selected) =>
+      val o = rows(row).orphan
+      label.setText(o.kindNote.fold(o.displayName) { note =>
+        s"<html>${escapeHtml(o.displayName)}&nbsp;&nbsp;<span style='color:${hex(palette.dimmed)}'>$note</span></html>"
+      })
+      if o.name.isEmpty && !selected then label.setForeground(palette.dimmed)
+    })
+    columns.getColumn(2).setCellRenderer(renderer(SwingConstants.TRAILING) { (label, row, selected) =>
+      val o = rows(row).orphan
+      label.setText(o.size.pretty)
+      if o.size.isZero && !selected then label.setForeground(palette.dimmed)
+    })
+    columns.getColumn(3).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, selected) =>
+      val o = rows(row).orphan
+      label.setText(riskSummary(o.risk))
+      if !selected then label.setForeground(riskColor(o.risk))
+      if o.saves.nonEmpty then
+        label.setToolTipText(o.saves.map(s => s"${s.path} (${s.size.pretty}): ${s.cloud.label}").mkString("<html>", "<br>", "</html>"))
+    })
+    columns.getColumn(4).setCellRenderer(renderer(SwingConstants.TRAILING) { (label, row, selected) =>
+      label.setText(s"#${rows(row).orphan.appId}")
+      if !selected then label.setForeground(palette.dimmed)
+    })
+
+    gameTable.getSelectionModel.addListSelectionListener(e => if !e.getValueIsAdjusting then showDetails())
+    gameTable.addMouseListener(new MouseAdapter:
+      override def mouseClicked(e: MouseEvent): Unit =
+        if e.getClickCount == 2 && gameTable.columnAtPoint(e.getPoint) != 0 then openSelected())
+    // Space toggles the checkboxes of all selected rows.
+    gameTable.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke("SPACE"), "toggle-checked")
+    gameTable.getActionMap.put("toggle-checked", new AbstractAction:
+      override def actionPerformed(e: ActionEvent): Unit = if !busy then toggleSelected())
+
+  private def setupDetailTable(): Unit =
+    detailTable.setFillsViewportHeight(true)
+    detailTable.setShowGrid(false)
+    val columns = detailTable.getColumnModel
+    List(0 -> 110, 1 -> 560, 2 -> 90, 3 -> 260).foreach((i, w) => columns.getColumn(i).setPreferredWidth(w))
+    columns.getColumn(1).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, _) =>
+      label.setToolTipText(details(row).path.toString)
+    })
+    columns.getColumn(2).setCellRenderer(renderer(SwingConstants.TRAILING)((_, _, _) => ()))
+    columns.getColumn(3).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, selected) =>
+      details(row).cloud.foreach(c => if !selected then label.setForeground(riskColor(c.risk)))
+    })
+    detailTable.addMouseListener(new MouseAdapter:
+      override def mouseClicked(e: MouseEvent): Unit =
+        val row = detailTable.rowAtPoint(e.getPoint)
+        if e.getClickCount == 2 && row >= 0 then open(details(row).path))
+
+  private def layout(): Unit =
+    val hints = List(
+      "Games whose saves aren't backed up start unchecked. Space toggles the selected rows; double-click opens a folder.",
+      "Save detection is a heuristic: games that save elsewhere aren't covered, so check the details before deleting."
+    ).map { text =>
+      val hint = JLabel(text)
+      dimLabels += hint
+      hint
+    }
+    val header = JPanel()
+    header.setLayout(BoxLayout(header, BoxLayout.Y_AXIS))
+    header.setBorder(BorderFactory.createEmptyBorder(12, 16, 10, 16))
+    (title :: subtitle :: hints).foreach(c => { val _ = header.add(c) })
+
+    val detailPanel = JPanel(BorderLayout(0, 4))
+    detailPanel.add(detailTitle, BorderLayout.NORTH)
+    detailPanel.add(JScrollPane(detailTable), BorderLayout.CENTER)
+    detailPanel.setBorder(BorderFactory.createEmptyBorder(8, 0, 0, 0))
+
+    val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(gameTable), detailPanel)
+    split.setResizeWeight(0.7)
+    split.setBorder(BorderFactory.createEmptyBorder(0, 16, 0, 16))
+
+    val buttons = JPanel(FlowLayout(FlowLayout.TRAILING, 6, 0))
+    List(selectSafeButton, selectAllButton, selectNoneButton, openButton, deleteButton)
+      .foreach(b => { val _ = buttons.add(b) })
+    val left = JPanel(FlowLayout(FlowLayout.LEADING, 8, 0))
+    left.add(JLabel("Theme:"))
+    left.add(themeBox)
+    left.add(status)
+    left.add(progress)
+    val footer = JPanel(BorderLayout())
+    footer.setBorder(BorderFactory.createEmptyBorder(10, 16, 12, 16))
+    footer.add(left, BorderLayout.CENTER)
+    footer.add(buttons, BorderLayout.EAST)
+
+    selectSafeButton.setToolTipText("Select games whose saves are in Steam Cloud, or that have no saves")
+    selectSafeButton.addActionListener(_ => setChecked(_.group != SaveGroup.NotBackedUp))
+    selectAllButton.addActionListener(_ => setChecked(_ => true))
+    selectNoneButton.addActionListener(_ => setChecked(_ => false))
+    openButton.addActionListener(_ => openSelected())
+    deleteButton.addActionListener(_ => deleteChecked())
+    themeBox.setSelectedItem(initialTheme)
+    themeBox.setToolTipText("Auto follows the desktop's dark mode setting")
+    themeBox.addActionListener(_ => switchTheme())
+    styleLabels()
+
+    val content = frame.getContentPane
+    content.add(header, BorderLayout.NORTH)
+    content.add(split, BorderLayout.CENTER)
+    content.add(footer, BorderLayout.SOUTH)
+
+  def show(): Unit =
+    setupGameTable()
+    setupDetailTable()
+    layout()
+    frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE)
+    frame.setSize(1150, 760)
+    frame.setLocationRelativeTo(null)
+    setBusy(true)
+    progress.setIndeterminate(true)
+    refresh()
+    frame.setVisible(true)
+    inBackground(scan(steamDir)) {
+      case Success(Right(result)) => loaded(result)
+      case Success(Left(error))   => fatal(error)
+      case Failure(e)             => fatal(s"Scanning failed: ${e.toString}")
+    }
+
+  private def fatal(message: String): Unit =
+    JOptionPane.showMessageDialog(frame, message, frame.getTitle, JOptionPane.ERROR_MESSAGE)
+    sys.exit(1)
+
+  private def loaded(result: Scan): Unit =
+    scanned = Some(result)
+    rows ++= result.orphans.map(o => GameRow(o, checked = o.group != SaveGroup.NotBackedUp))
+    gameModel.fireTableDataChanged()
+    setBusy(false)
+    if rows.nonEmpty then gameTable.setRowSelectionInterval(0, 0)
+
+  private def setBusy(value: Boolean): Unit =
+    busy = value
+    progress.setVisible(value)
+    gameTable.setEnabled(!value)
+    refresh()
+
+  /** Updates the header, footer and buttons from the current rows. */
+  private def refresh(): Unit =
+    scanned.foreach { s =>
+      val total = totalSize(rows.map(_.orphan))
+      title.setText(if rows.isEmpty then "Nothing to clean up" else s"Uninstalled games are using ${total.pretty}")
+      subtitle.setText(s"${gameCount(rows.size)} · keeping ${plural(s.installedCount, "installed app")} and " +
+        s"${plural(s.shortcutCount, "non-Steam shortcut")} · ${s.libraries.mkString(", ")}")
+    }
+    val checked = rows.filter(_.checked)
+    if !busy then
+      val freedText = if freed.isZero then "" else s"Freed ${freed.pretty} · "
+      status.setText(s"$freedText${checked.size} of ${rows.size} selected · ${totalSize(checked.map(_.orphan)).pretty}")
+    List(selectSafeButton, selectAllButton, selectNoneButton).foreach(_.setEnabled(!busy && rows.nonEmpty))
+    openButton.setEnabled(!busy && selectedRows.nonEmpty)
+    deleteButton.setEnabled(!busy && checked.nonEmpty)
+
+  private def selectedRows: List[GameRow] =
+    gameTable.getSelectedRows.toList.map(gameTable.convertRowIndexToModel).map(rows(_))
+
+  private def showDetails(): Unit =
+    details = selectedRows.headOption.fold(Vector.empty) { row =>
+      val o = row.orphan
+      (o.leftovers.map(l => Detail(l.kind.label, l.path.toString, l.path, l.size, None)) ++
+        o.saves.map(s => Detail("Save", s.path, s.fullPath, s.size, Some(s.cloud)))).toVector
+    }
+    detailModel.fireTableDataChanged()
+    refresh()
+
+  private def setChecked(f: Orphan => Boolean): Unit =
+    rows.foreach(row => row.checked = f(row.orphan))
+    gameModel.fireTableRowsUpdated(0, rows.size - 1)
+    refresh()
+
+  private def toggleSelected(): Unit =
+    val selected = selectedRows
+    val value = !selected.forall(_.checked)
+    selected.foreach(_.checked = value)
+    gameModel.fireTableRowsUpdated(0, rows.size - 1)
+    refresh()
+
+  private def open(path: Path): Unit =
+    openInFileManager(path).failed.foreach { e =>
+      JOptionPane.showMessageDialog(frame, s"Could not open ${path.toString}: ${e.getMessage}", frame.getTitle,
+        JOptionPane.ERROR_MESSAGE)
+    }
+
+  private def openSelected(): Unit = selectedRows.headOption.flatMap(_.orphan.leftovers.headOption).foreach(l => open(l.path))
+
+  private def deleteChecked(): Unit =
+    val chosen = rows.filter(_.checked).toList
+    if chosen.isEmpty then return
+    val risky = chosen.filter(_.orphan.group == SaveGroup.NotBackedUp).map(_.orphan.displayName)
+    val warning =
+      if risky.isEmpty then ""
+      else
+        val listed = risky.take(8).map(n => s"  • $n").mkString("\n")
+        val more = if risky.size > 8 then s"\n  … and ${risky.size - 8} more" else ""
+        s"\n\nThese games have saves that are NOT backed up. Deleting loses them for good:\n$listed$more"
+    val message = s"Delete the leftovers of ${gameCount(chosen.size)} (${totalSize(chosen.map(_.orphan)).pretty})?$warning"
+    val options = Array[Object]("Delete", "Cancel")
+    val messageType = if risky.isEmpty then JOptionPane.QUESTION_MESSAGE else JOptionPane.WARNING_MESSAGE
+    val answer = JOptionPane.showOptionDialog(frame, message, "Delete leftovers", JOptionPane.YES_NO_OPTION,
+      messageType, null, options, options(1))
+    if answer != 0 then return
+
+    setBusy(true)
+    progress.setIndeterminate(false)
+    progress.setMaximum(chosen.size)
+    progress.setValue(0)
+    inBackground {
+      chosen.zipWithIndex.map { (row, i) =>
+        SwingUtilities.invokeLater { () =>
+          progress.setValue(i)
+          status.setText(s"Deleting ${row.orphan.displayName}…")
+        }
+        // A failed delete may still have removed part of the tree, so measure what is left.
+        val results = deleteLeftovers(row.orphan).map {
+          case (l, None)    => (l, None)
+          case (l, Some(e)) => (l.copy(size = if Files.exists(l.path) then treeSize(l.path) else Bytes.Zero), Some(e))
+        }
+        row -> results
+      }
+    }(deleted)
+
+  private def deleted(result: Try[List[(GameRow, List[(Leftover, Option[Exception])])]]): Unit =
+    val outcomes = result match
+      case Success(outcomes) => outcomes
+      case Failure(e) =>
+        JOptionPane.showMessageDialog(frame, s"Deleting failed: ${e.toString}", frame.getTitle, JOptionPane.ERROR_MESSAGE)
+        Nil
+    outcomes.foreach { (row, results) =>
+      freed += results.collect { case (l, None) => l.size }.sum
+      val remaining = results.collect { case (l, Some(_)) => l }
+      if remaining.isEmpty then
+        val _ = rows -= row
+      else
+        val keepsPrefix = remaining.exists(_.kind == LeftoverKind.Prefix)
+        row.orphan = row.orphan.copy(leftovers = remaining, saves = if keepsPrefix then row.orphan.saves else Nil)
+    }
+    gameModel.fireTableDataChanged()
+    setBusy(false)
+    showDetails()
+    val failures = for
+      (_, results)      <- outcomes
+      case (l, Some(e)) <- results
+    yield s"${l.path.toString}: ${e.getMessage}"
+    if failures.nonEmpty then
+      val more = if failures.size > 10 then s"\n… and ${failures.size - 10} more" else ""
+      JOptionPane.showMessageDialog(frame, s"Some leftovers could not be deleted:\n${failures.take(10).mkString("\n")}$more",
+        frame.getTitle, JOptionPane.WARNING_MESSAGE)
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Main
+
+@main def run(rawArgs: String*): Unit =
+  val defaultSteamDir = SteamDir(Paths.get(sys.props("user.home"), ".local/share/Steam"))
+  val args = parseArgs(rawArgs.toList, Args(defaultSteamDir, Mode.Gui, Theme.Auto))
+
+  args.mode match
+    case Mode.Cli(action) => runCli(args.steamDir, action)
+    case Mode.Gui if GraphicsEnvironment.isHeadless =>
+      System.err.println("No display found, so showing a dry run in the terminal. Pass --cli to skip this check.")
+      runCli(args.steamDir, CliAction.DryRun)
+    case Mode.Gui =>
+      if !(needsNonReparentingRelaunch && relaunchNonReparenting(rawArgs)) then Gui.start(args.steamDir, args.theme)
