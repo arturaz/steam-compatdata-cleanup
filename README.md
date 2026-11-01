@@ -10,7 +10,11 @@ backed up.
 ## Requirements
 
 - [scala-cli](https://scala-cli.virtuslab.org/install). It downloads Scala, a JVM and the dependencies on the first
-  run. If scala-cli is missing, the script prints the install link and exits.
+  run. If scala-cli is missing, the script prints the install link and exits. When it was not started from a
+  terminal (for example by double-clicking it in a file manager), it shows the link in a dialog instead, using
+  `kdialog`, `zenity`, `xmessage` or `notify-send`, whichever is available (`osascript` on macOS). Because desktop
+  launchers often do not load your shell's `PATH`, the script also looks for scala-cli in the usual install locations
+  (coursier, SDKMAN!, Nix, Homebrew, `~/.local/bin`, `/usr/local/bin`).
 - Linux with native Steam at `~/.local/share/Steam`, or another Steam directory passed with `--steam-dir`.
 
 ## Usage

@@ -1,4 +1,28 @@
-#!/usr/bin/env -S sh -c 'command -v scala-cli >/dev/null||{ echo "cleanup.scala needs scala-cli: https://scala-cli.virtuslab.org/install">&2;exit 127;};exec scala-cli shebang "$0" "$@"'
+#!/usr/bin/env -S sh -c 'eval "$(sed -n "s|^//sh ||p" "$0")"'
+//sh # Shell bootstrap, run by the line above: find scala-cli, or explain how to get it (a dialog when not in a terminal).
+//sh # A GUI double-click does not read shell rc files, so also look in the usual install locations.
+//sh for d in "$HOME/.local/share/coursier/bin" "$HOME/Library/Application Support/Coursier/bin" \
+//sh   "$HOME/.sdkman/candidates/scalacli/current/bin" "$HOME/.nix-profile/bin" "$HOME/.local/bin" \
+//sh   /opt/homebrew/bin /usr/local/bin; do PATH="$PATH:$d"; done
+//sh command -v scala-cli >/dev/null 2>&1 && exec scala-cli shebang "$0" "$@"
+//sh url=https://scala-cli.virtuslab.org/install; title="Steam compatdata cleanup"
+//sh msg="cleanup.scala needs scala-cli to run. Install it from $url and start the script again."
+//sh echo "$msg" >&2
+//sh if [ -t 2 ]; then [ -t 0 ] && printf "Press Enter to close." >&2 && read -r _; exit 127; fi
+//sh has() { command -v "$1" >/dev/null 2>&1; }; ask="Open install page"
+//sh if has osascript; then
+//sh   osascript -e "display dialog \"$msg\" with title \"$title\" buttons {\"Close\", \"$ask\"} default button 2 with icon stop" \
+//sh     -e "if button returned of result is \"$ask\" then open location \"$url\"" >/dev/null 2>&1
+//sh elif has kdialog && case "$XDG_CURRENT_DESKTOP" in *KDE*) true;; *) ! has zenity;; esac; then
+//sh   kdialog --title "$title" --yes-label "$ask" --no-label Close --yesno "$msg" && xdg-open "$url"
+//sh elif has zenity; then
+//sh   zenity --question --title="$title" --ok-label="$ask" --cancel-label=Close --text="$msg" && xdg-open "$url"
+//sh elif has xmessage; then
+//sh   xmessage -center -title "$title" -buttons "$ask:0,Close:1" "$msg" && xdg-open "$url"
+//sh elif has notify-send; then
+//sh   notify-send -u critical "$title" "$msg"
+//sh fi >/dev/null 2>&1
+//sh exit 127
 //> using scala 3.9.0
 //> using options -Wall -Werror -language:strictEquality
 //> using dep io.github.arturaz::yantl:0.4.3
@@ -7,7 +31,8 @@
 // Removes Proton prefixes (steamapps/compatdata/<appid>) and shader caches (steamapps/shadercache/<appid>)
 // for games that are no longer installed.
 //
-// Requires scala-cli (https://scala-cli.virtuslab.org/install); running without it prints that link.
+// Requires scala-cli (https://scala-cli.virtuslab.org/install); running without it shows that link (in a dialog
+// when not started from a terminal).
 //
 // Usage:
 //   ./cleanup.scala                  # GUI: pick games to delete (dry run in the terminal if there is no display)
