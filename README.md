@@ -90,3 +90,7 @@ Steam's `userdata`, are not covered. Check the list before you delete.
 
 Game names and cloud information come from Steam's local caches (`appcache/appinfo.vdf`,
 `userdata/*/config/localconfig.vdf`). The script makes no network requests.
+
+## License
+
+[Blue Oak Model License 1.0.0](LICENSE.md).
