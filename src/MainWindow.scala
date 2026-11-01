@@ -2,7 +2,7 @@ import java.awt.{BorderLayout, Color, Component, FlowLayout, Font}
 import java.awt.event.{ActionEvent, MouseAdapter, MouseEvent}
 import java.nio.file.{Files, Path}
 import javax.swing.{AbstractAction, BorderFactory, BoxLayout, JButton, JComboBox, JComponent, JFrame, JLabel, JOptionPane,
-  JPanel, JProgressBar, JScrollPane, JSplitPane, JTable, KeyStroke, SwingConstants, SwingUtilities, UIManager,
+  JPanel, JProgressBar, JScrollPane, JSplitPane, JTabbedPane, JTable, KeyStroke, SwingConstants, SwingUtilities, UIManager,
   WindowConstants}
 import javax.swing.table.{AbstractTableModel, DefaultTableCellRenderer}
 import scala.collection.mutable.ArrayBuffer
@@ -25,6 +25,7 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
 
   private val frame = JFrame("Steam leftovers cleanup")
   private val rows = ArrayBuffer.empty[GameRow]
+  private var kept = Vector.empty[Kept]
   private var details = Vector.empty[Detail]
   private var scanned: Option[Scan] = None
   private var freed = Bytes.Zero
@@ -69,9 +70,27 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
         case 2 => d.size.pretty
         case _ => d.cloud.fold("")(_.label)
 
+  private object keptModel extends AbstractTableModel:
+    private val columns = Vector("App", "Kept because", "Size", "App ID")
+    def getRowCount: Int = kept.size
+    def getColumnCount: Int = columns.size
+    override def getColumnName(column: Int): String = columns(column)
+    override def getColumnClass(column: Int): Class[?] = column match
+      case 0 | 1 => classOf[String]
+      case _     => classOf[java.lang.Long]
+    def getValueAt(row: Int, column: Int): Object =
+      val k = kept(row)
+      column match
+        case 0 => k.displayName
+        case 1 => k.reason.label
+        case 2 => java.lang.Long.valueOf(k.size.unwrap)
+        case _ => java.lang.Long.valueOf(k.appId.unwrap)
+
   // Lazy: the models refer to this window, so they can only be handed out once it is constructed.
   private lazy val gameTable = JTable(gameModel)
   private lazy val detailTable = JTable(detailModel)
+  private lazy val keptTable = JTable(keptModel)
+  private val tabs = JTabbedPane()
   private val title = JLabel("Scanning Steam libraries…")
   private val subtitle = JLabel(" ")
   private val status = JLabel(" ")
@@ -164,6 +183,39 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
     gameTable.getActionMap.put("toggle-checked", new AbstractAction:
       override def actionPerformed(e: ActionEvent): Unit = if !busy then toggleSelected())
 
+  private def setupKeptTable(): Unit =
+    keptTable.setAutoCreateRowSorter(true)
+    keptTable.setFillsViewportHeight(true)
+    keptTable.setShowGrid(false)
+    keptTable.setRowHeight((keptTable.getRowHeight * 1.4).toInt)
+    val columns = keptTable.getColumnModel
+    List(0 -> 420, 1 -> 160, 2 -> 90, 3 -> 110).foreach((i, w) => columns.getColumn(i).setPreferredWidth(w))
+    columns.getColumn(0).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, selected) =>
+      val k = kept(row)
+      label.setText(k.kindNote.fold(k.displayName) { note =>
+        s"<html>${escapeHtml(k.displayName)}&nbsp;&nbsp;<span style='color:${hex(palette.dimmed)}'>$note</span></html>"
+      })
+      label.setToolTipText(k.leftovers.map(l => s"${l.path.toString} (${l.size.pretty})").mkString("<html>", "<br>", "</html>"))
+      if k.name.isEmpty && !selected then label.setForeground(palette.dimmed)
+    })
+    columns.getColumn(1).setCellRenderer(renderer(SwingConstants.LEADING) { (label, row, selected) =>
+      if kept(row).reason == KeepReason.Installed && !selected then label.setForeground(palette.dimmed)
+    })
+    columns.getColumn(2).setCellRenderer(renderer(SwingConstants.TRAILING) { (label, row, selected) =>
+      val k = kept(row)
+      label.setText(k.size.pretty)
+      if k.size.isZero && !selected then label.setForeground(palette.dimmed)
+    })
+    columns.getColumn(3).setCellRenderer(renderer(SwingConstants.TRAILING) { (label, row, selected) =>
+      label.setText(s"#${kept(row).appId}")
+      if !selected then label.setForeground(palette.dimmed)
+    })
+    keptTable.addMouseListener(new MouseAdapter:
+      override def mouseClicked(e: MouseEvent): Unit =
+        val row = keptTable.rowAtPoint(e.getPoint)
+        if e.getClickCount == 2 && row >= 0 then
+          kept(keptTable.convertRowIndexToModel(row)).leftovers.headOption.foreach(l => open(l.path)))
+
   private def setupDetailTable(): Unit =
     detailTable.setFillsViewportHeight(true)
     detailTable.setShowGrid(false)
@@ -202,7 +254,16 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
 
     val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(gameTable), detailPanel)
     split.setResizeWeight(0.7)
-    split.setBorder(BorderFactory.createEmptyBorder(0, 16, 0, 16))
+    val keptHint = JLabel("Installed games and non-Steam shortcuts are never deleted. Double-click to open the folder.")
+    dimLabels += keptHint
+    keptHint.setBorder(BorderFactory.createEmptyBorder(0, 0, 6, 0))
+    val keptPanel = JPanel(BorderLayout())
+    keptPanel.add(keptHint, BorderLayout.NORTH)
+    keptPanel.add(JScrollPane(keptTable), BorderLayout.CENTER)
+    keptPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8))
+    tabs.addTab("Uninstalled", split)
+    tabs.addTab("Kept", keptPanel)
+    tabs.setBorder(BorderFactory.createEmptyBorder(0, 16, 0, 16))
 
     val buttons = JPanel(FlowLayout(FlowLayout.TRAILING, 6, 0))
     List(selectSafeButton, selectAllButton, selectNoneButton, openButton, deleteButton)
@@ -230,12 +291,13 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
 
     val content = frame.getContentPane
     content.add(header, BorderLayout.NORTH)
-    content.add(split, BorderLayout.CENTER)
+    content.add(tabs, BorderLayout.CENTER)
     content.add(footer, BorderLayout.SOUTH)
 
   def show(): Unit =
     setupGameTable()
     setupDetailTable()
+    setupKeptTable()
     layout()
     frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE)
     frame.setSize(1150, 760)
@@ -257,7 +319,9 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
   private def loaded(result: Scan): Unit =
     scanned = Some(result)
     rows ++= result.orphans.map(o => GameRow(o, checked = o.group != SaveGroup.NotBackedUp))
+    kept = result.kept.toVector
     gameModel.fireTableDataChanged()
+    keptModel.fireTableDataChanged()
     setBusy(false)
     if rows.nonEmpty then gameTable.setRowSelectionInterval(0, 0)
 
@@ -273,7 +337,10 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
       val total = totalSize(rows.map(_.orphan))
       title.setText(if rows.isEmpty then "Nothing to clean up" else s"Uninstalled games are using ${total.pretty}")
       subtitle.setText(s"${gameCount(rows.size)} · keeping ${plural(s.installedCount, "installed app")} and " +
-        s"${plural(s.shortcutCount, "non-Steam shortcut")} · ${s.libraries.mkString(", ")}")
+        s"${plural(s.shortcutCount, "non-Steam shortcut")} (${totalSize(kept).pretty} of prefixes and shader caches)" +
+        s" · ${s.libraries.mkString(", ")}")
+      tabs.setTitleAt(0, s"Uninstalled (${rows.size}, ${total.pretty})")
+      tabs.setTitleAt(1, s"Kept (${kept.size}, ${totalSize(kept).pretty})")
     }
     val checked = rows.filter(_.checked)
     if !busy then

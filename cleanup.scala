@@ -79,7 +79,8 @@
 //
 // An app is considered installed if any Steam library has steamapps/appmanifest_<appid>.acf.
 //
-// Non-Steam shortcuts (from userdata/*/config/shortcuts.vdf) and appid 0 are always kept.
+// Non-Steam shortcuts (from userdata/*/config/shortcuts.vdf) and appid 0 are always kept. Kept apps are listed with
+// the size of their prefixes and shader caches (the "Kept" tab in the GUI), to show where the rest of the space goes.
 //
 // Game names and Steam Cloud rules come from Steam's local caches; no network access.
 // help:end

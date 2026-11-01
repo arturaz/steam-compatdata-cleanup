@@ -43,6 +43,10 @@ saves below the list. Games whose saves are not backed up start unchecked. Check
 toggles the selected rows) and press **Delete selected…**. A confirmation lists any games whose saves would be lost.
 Double-click a game or a save to open its folder.
 
+The **Kept** tab lists the installed games and non-Steam shortcuts that have a prefix or shader cache, largest first.
+These are never deleted, but they show where the rest of `compatdata` goes. For example, a launcher such as Battle.net
+added as a non-Steam shortcut installs its games inside its own prefix, which can take hundreds of gigabytes.
+
 If there is no display (for example over SSH), the script prints a dry run in the terminal instead.
 
 `--theme` picks the starting look; the **Theme** dropdown in the window switches it live:
@@ -58,7 +62,8 @@ itself with the variable set.
 
 ### Terminal
 
-`--cli` only lists what would be deleted, so run it first to review. In interactive mode you answer `y` (delete),
+`--cli` only lists what would be deleted, so run it first to review. After the uninstalled games, every mode also
+lists the kept apps (installed games and non-Steam shortcuts) with the size of their prefixes and shader caches. In interactive mode you answer `y` (delete),
 `N` (skip, default), `a` (delete this and all remaining) or `q` (quit).
 
 ## What gets deleted

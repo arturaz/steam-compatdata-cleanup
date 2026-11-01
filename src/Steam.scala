@@ -42,6 +42,36 @@ def shortcutAppIds(steamDir: SteamDir): Set[AppId] =
     }
     .toSet
 
+/** Names of non-Steam shortcuts. Only for display: which ids to keep comes from [[shortcutAppIds]], which does not
+  * depend on parsing the whole file.
+  */
+def shortcutNames(steamDir: SteamDir): Map[AppId, GameName] =
+  steamDir.userdataDirs
+    .map(_.resolve("config/shortcuts.vdf"))
+    .filter(Files.isRegularFile(_))
+    .flatMap { file =>
+      val root = Try {
+        val buf = ByteBuffer.wrap(Files.readAllBytes(file)).order(ByteOrder.LITTLE_ENDIAN)
+        readBinaryVdfBlock(buf, () => VdfKey(readCString(buf)))
+      }.toOption
+      for
+        shortcuts <- root.flatMap(_.block("shortcuts")).toList
+        (_, s)    <- shortcuts.childBlocks
+        id        <- s.long("appid")
+        name      <- s.str("AppName").filter(_.nonEmpty)
+      yield AppId.fromUnsignedInt(id.toInt) -> GameName(name)
+    }
+    .toMap
+
+/** Names of installed apps from their appmanifests. */
+def installedNames(libraries: List[LibraryDir], wanted: Set[AppId]): Map[AppId, GameName] =
+  (for
+    lib  <- libraries
+    id   <- wanted.toList
+    vdf  <- readTextVdf(lib.steamapps.resolve(s"appmanifest_${id.unwrap}.acf"))
+    name <- vdf.str("AppState", "name")
+  yield id -> GameName(name)).toMap
+
 /** Reads the "appinfo" section for the given ids from appcache/appinfo.vdf.
   *
   * Format (versions 0x27, 0x28, 0x29 of magic 0x075644xx):
@@ -61,40 +91,17 @@ def appInfos(steamDir: SteamDir, wanted: Set[AppId]): Map[AppId, Vdf.BinaryBlock
     require((magic >>> 8) == 0x075644 && version >= 0x27 && version <= 0x29, f"unknown appinfo.vdf magic 0x$magic%08x")
     buf.getInt // universe
 
-    def cString(): String =
-      val start = buf.position
-      while buf.get != 0 do ()
-      new String(buf.array, start, buf.position - start - 1, StandardCharsets.UTF_8)
-
     val stringTable: IndexedSeq[String] =
       if version < 0x29 then IndexedSeq.empty
       else
         val offset = buf.getLong.toInt
         val saved = buf.position
         buf.position(offset)
-        val table = IndexedSeq.fill(buf.getInt)(cString())
+        val table = IndexedSeq.fill(buf.getInt)(readCString(buf))
         buf.position(saved)
         table
 
-    def key(): VdfKey = VdfKey(if version >= 0x29 then stringTable(buf.getInt) else cString())
-
-    /** Parses a block body until 0x08. Pointers, colors and wide strings are skipped (Steam doesn't use them here). */
-    def readBlock(): Vdf.BinaryBlock =
-      val b = Map.newBuilder[VdfKey, Vdf.Value[Vdf.BinaryLeaf]]
-      var tpe = buf.get & 0xff
-      while tpe != 0x08 do
-        val k = key()
-        tpe match
-          case 0x00        => b += k -> Vdf.Value.Nested(readBlock())
-          case 0x01        => b += k -> Vdf.Value.Leaf(Vdf.Str(cString()))
-          case 0x02        => b += k -> Vdf.Value.Leaf(Vdf.Int32(buf.getInt))
-          case 0x03        => b += k -> Vdf.Value.Leaf(Vdf.Float32(buf.getFloat))
-          case 0x07 | 0x0a => b += k -> Vdf.Value.Leaf(Vdf.Int64(buf.getLong))
-          case 0x04 | 0x06 => buf.getInt
-          case 0x05        => while buf.getShort != 0 do ()
-          case other       => throw IllegalStateException(s"unknown KV type 0x${other.toHexString}")
-        tpe = buf.get & 0xff
-      Vdf.Block(b.result())
+    def key(): VdfKey = VdfKey(if version >= 0x29 then stringTable(buf.getInt) else readCString(buf))
 
     val infos = Map.newBuilder[AppId, Vdf.BinaryBlock]
     var appId = AppId.fromUnsignedInt(buf.getInt)
@@ -103,7 +110,7 @@ def appInfos(steamDir: SteamDir, wanted: Set[AppId]): Map[AppId, Vdf.BinaryBlock
       val next = buf.position + size
       if wanted.contains(appId) then
         buf.position(buf.position + 4 + 4 + 8 + 20 + 4 + (if version >= 0x28 then 20 else 0))
-        readBlock().block("appinfo").foreach(info => infos += appId -> info)
+        readBinaryVdfBlock(buf, key).block("appinfo").foreach(info => infos += appId -> info)
       buf.position(next)
       appId = AppId.fromUnsignedInt(buf.getInt)
     infos.result()

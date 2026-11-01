@@ -115,3 +115,29 @@ def parseTextVdf(s: String): Vdf.TextBlock =
 
 def readTextVdf(file: Path): Option[Vdf.TextBlock] =
   if !Files.isRegularFile(file) then None else Try(parseTextVdf(Files.readString(file))).toOption
+
+/** Reads a NUL-terminated UTF-8 string at the buffer's position. The buffer must wrap a whole array. */
+def readCString(buf: java.nio.ByteBuffer): String =
+  val start = buf.position
+  while buf.get != 0 do ()
+  new String(buf.array, start, buf.position - start - 1, java.nio.charset.StandardCharsets.UTF_8)
+
+/** Parses a binary VDF block body until 0x08. `key` reads one key, whose encoding depends on the file. Pointers,
+  * colors and wide strings are skipped (Steam doesn't use them in the files read here).
+  */
+def readBinaryVdfBlock(buf: java.nio.ByteBuffer, key: () => VdfKey): Vdf.BinaryBlock =
+  val b = Map.newBuilder[VdfKey, Vdf.Value[Vdf.BinaryLeaf]]
+  var tpe = buf.get & 0xff
+  while tpe != 0x08 do
+    val k = key()
+    tpe match
+      case 0x00        => b += k -> Vdf.Value.Nested(readBinaryVdfBlock(buf, key))
+      case 0x01        => b += k -> Vdf.Value.Leaf(Vdf.Str(readCString(buf)))
+      case 0x02        => b += k -> Vdf.Value.Leaf(Vdf.Int32(buf.getInt))
+      case 0x03        => b += k -> Vdf.Value.Leaf(Vdf.Float32(buf.getFloat))
+      case 0x07 | 0x0a => b += k -> Vdf.Value.Leaf(Vdf.Int64(buf.getLong))
+      case 0x04 | 0x06 => buf.getInt
+      case 0x05        => while buf.getShort != 0 do ()
+      case other       => throw IllegalStateException(s"unknown KV type 0x${other.toHexString}")
+    tpe = buf.get & 0xff
+  Vdf.Block(b.result())

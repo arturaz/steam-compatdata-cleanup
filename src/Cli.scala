@@ -46,6 +46,20 @@ def printSection(heading: String, games: List[Orphan], nameW: Int): Unit =
   }
   println()
 
+/** Prints the kept apps, so it's clear where the space that cannot be cleaned up goes. */
+def printKept(kept: List[Kept], nameW: Int): Unit =
+  if kept.isEmpty then return
+  println(bold("Kept: installed games and non-Steam shortcuts") +
+    dim(s" (${plural(kept.size, "app")}, ${totalSize(kept).pretty}) — never deleted"))
+  kept.foreach { k =>
+    val size = if k.size.isZero then dim(k.size.pretty) else k.size.pretty
+    val name = if k.name.isEmpty then dim(k.displayName) else k.displayName
+    val notes = (Option.when(k.reason == KeepReason.Shortcut)(k.reason.label) ++ k.kindNote).mkString(", ")
+    val note = if notes.isEmpty then "" else s"  ${dim(notes)}"
+    println(s"    ${padRight(name, nameW)}  ${padLeft(size, sizeW)}  ${dim(s"#${k.appId}")}$note")
+  }
+  println()
+
 def delete(o: Orphan): Bytes =
   deleteLeftovers(o).map {
     case (l, None) =>
@@ -84,8 +98,11 @@ def runCli(steamDir: SteamDir, action: CliAction): Unit =
     s"${plural(result.shortcutCount, "non-Steam shortcut")}."))
 
   val orphans = result.orphans // display order = interactive order
+  val nameW = (result.kept.map(k => displayWidth(k.displayName)) ++ orphans.map(o => displayWidth(o.displayName)) ++
+    orphans.flatMap(_.saves.map(s => displayWidth(s.path) + 5))).maxOption.getOrElse(0).min(60)
   if orphans.isEmpty then
-    println(green("\nNothing to clean up."))
+    println(green("\nNothing to clean up.\n"))
+    printKept(result.kept, nameW)
     return
 
   def inGroup(g: SaveGroup) = orphans.filter(_.group == g)
@@ -93,9 +110,6 @@ def runCli(steamDir: SteamDir, action: CliAction): Unit =
   val backedUp = inGroup(SaveGroup.BackedUp)
   val noSaves = inGroup(SaveGroup.NoSaves)
   def summary(os: List[Orphan]) = s"${gameCount(os.size)}, ${totalSize(os).pretty}"
-
-  val nameW = (orphans.map(o => displayWidth(o.displayName)) ++
-    orphans.flatMap(_.saves.map(s => displayWidth(s.path) + 5))).max.min(60)
 
   println()
   println(bold(s"Uninstalled games are using ${totalSize(orphans).pretty}") + dim(s" (${gameCount(orphans.size)})"))
@@ -111,6 +125,7 @@ def runCli(steamDir: SteamDir, action: CliAction): Unit =
     nameW
   )
   printSection(green(bold("✓ No save data found")) + dim(s" (${summary(noSaves)})"), noSaves, nameW)
+  printKept(result.kept, nameW)
 
   action match
     case CliAction.DryRun =>
