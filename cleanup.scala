@@ -1,5 +1,6 @@
 #!/usr/bin/env -S scala-cli shebang
 //> using scala 3.9.0
+//> using options -Wall -Werror -language:strictEquality
 //> using dep io.github.arturaz::yantl:0.4.3
 
 // Removes Proton prefixes (steamapps/compatdata/<appid>) and shader caches (steamapps/shadercache/<appid>)
@@ -93,7 +94,7 @@ object LibraryDir extends Newtype.WithoutValidationOf[Path]:
 type LibraryDir = LibraryDir.Type
 
 /** Kinds of per-app data Steam leaves behind after uninstalling. */
-enum LeftoverKind(val dirName: String):
+enum LeftoverKind(val dirName: String) derives CanEqual:
   /** Proton/Wine prefix: steamapps/compatdata/<appid>. */
   case Prefix extends LeftoverKind("compatdata")
   /** Compiled shader cache: steamapps/shadercache/<appid>. */
@@ -104,7 +105,7 @@ case class Leftover(kind: LeftoverKind, path: Path, size: Bytes)
 // ---------------------------------------------------------------------------------------------------------------------
 // Arguments
 
-enum Mode:
+enum Mode derives CanEqual:
   case DryRun, Delete, Interactive
 
 case class Args(steamDir: SteamDir, mode: Mode)
@@ -143,7 +144,7 @@ def treeSize(path: Path): Bytes =
 
 /** Recursively deletes a tree, deleting symlinks themselves rather than their targets. */
 def deleteTree(dir: Path): Unit =
-  Files.walkFileTree(
+  val _ = Files.walkFileTree(
     dir,
     new SimpleFileVisitor[Path]:
       override def visitFile(f: Path, attrs: BasicFileAttributes) =
@@ -156,34 +157,83 @@ def deleteTree(dir: Path): Unit =
   )
 
 // ---------------------------------------------------------------------------------------------------------------------
-// VDF (Valve KeyValues) parsing. Keys and values are plain strings at this level; callers wrap them in semantic types.
+// VDF (Valve KeyValues) parsing.
 
-type KV = Map[String, Any]
+/** A key in a VDF block. Steam is inconsistent about key case, so lookups ignore it. */
+object VdfKey extends SimpleNewtype[String]
+type VdfKey = VdfKey.Type
 
-extension (kv: KV)
-  /** Follows a path of keys through nested maps. */
-  def at(path: String*): Option[Any] =
-    path.foldLeft(Option[Any](kv)) {
-      case (Some(m: Map[?, ?]), k) => m.asInstanceOf[KV].get(k)
-      case _                       => None
-    }
-  /** Like `at`, but matches keys case-insensitively (Steam's text VDF files are inconsistent about case). */
-  def ci(path: String*): Option[Any] =
-    path.foldLeft(Option[Any](kv)) {
-      case (Some(m: Map[?, ?]), k) => m.asInstanceOf[KV].collectFirst { case (key, v) if key.equalsIgnoreCase(k) => v }
-      case _                       => None
-    }
-  def str(path: String*): Option[String] = at(path*).collect { case s: String => s }
-  def obj(path: String*): Option[KV] = at(path*).flatMap(asKV)
-  /** Child maps, ignoring scalar values. */
-  def children: List[KV] = kv.values.toList.flatMap(asKV)
+object Vdf:
+  final case class Str(value: String)
+  final case class Int32(value: Int)
+  final case class Int64(value: Long)
+  final case class Float32(value: Float)
 
-def asKV(a: Any): Option[KV] = a match
-  case m: Map[?, ?] => Some(m.asInstanceOf[KV])
-  case _            => None
+  /** A value in a block: either a nested block or a leaf of type `L`. Tagged, so matching recovers the exact type. */
+  enum Value[+L]:
+    case Nested(block: Block[L])
+    case Leaf(value: L)
 
-/** Minimal parser for Steam's text VDF format. Nested maps and string values. */
-def parseTextVdf(s: String): KV =
+    def asBlock: Option[Block[L]] = this match
+      case Nested(block) => Some(block)
+      case Leaf(_)       => None
+
+    def asLeaf: Option[L] = this match
+      case Nested(_)   => None
+      case Leaf(value) => Some(value)
+
+  /** A block of key/value pairs. Covariant, so a block with fewer kinds of leaves can be used where one with more
+    * is expected.
+    */
+  final case class Block[+L](entries: Map[VdfKey, Value[L]])
+
+  /** Text VDF (libraryfolders.vdf, localconfig.vdf, ...) only has strings. */
+  type TextLeaf = Str
+  /** Binary VDF (appinfo.vdf) has everything text VDF has, plus typed numbers. */
+  type BinaryLeaf = TextLeaf | Int32 | Int64 | Float32
+
+  type TextBlock = Block[TextLeaf]
+  type BinaryBlock = Block[BinaryLeaf]
+
+  // Every text block is a valid binary block.
+  summon[TextBlock <:< BinaryBlock]
+
+extension [L](b: Vdf.Block[L])
+  /** Looks up a direct child, matching keys case-insensitively (Steam is inconsistent about case). */
+  def get(key: String): Option[Vdf.Value[L]] =
+    b.entries.get(VdfKey(key))
+      .orElse(b.entries.collectFirst { case (k, v) if k.unwrap.equalsIgnoreCase(key) => v })
+  /** Follows a path of keys through nested blocks. */
+  def at(path: String*): Option[Vdf.Value[L]] =
+    path.foldLeft(Option[Vdf.Value[L]](Vdf.Value.Nested(b)))((value, key) => value.flatMap(_.asBlock).flatMap(_.get(key)))
+  def block(path: String*): Option[Vdf.Block[L]] = at(path*).flatMap(_.asBlock)
+  def leaf(path: String*): Option[L] = at(path*).flatMap(_.asLeaf)
+  /** Child blocks with their keys, ignoring leaf values. */
+  def childBlocks: List[(VdfKey, Vdf.Block[L])] =
+    b.entries.toList.flatMap((key, value) => value.asBlock.map(key -> _))
+  /** Leaf values directly in this block. */
+  def leaves: List[L] = b.entries.values.toList.flatMap(_.asLeaf)
+
+// Leaf accessors are defined on BinaryBlock, so they cover every leaf kind exhaustively; TextBlocks get them through
+// covariance.
+extension (b: Vdf.BinaryBlock)
+  def str(path: String*): Option[String] = b.leaf(path*).flatMap(asString)
+  /** String values directly in this block. */
+  def strings: List[String] = b.leaves.flatMap(asString)
+  /** A whole number, whether stored as a binary integer or as text. */
+  def long(path: String*): Option[Long] = b.leaf(path*).flatMap {
+    case Vdf.Int32(i)   => Some(i.toLong)
+    case Vdf.Int64(l)   => Some(l)
+    case Vdf.Str(s)     => s.toLongOption
+    case Vdf.Float32(_) => None
+  }
+
+def asString(leaf: Vdf.BinaryLeaf): Option[String] = leaf match
+  case Vdf.Str(s)                                  => Some(s)
+  case Vdf.Int32(_) | Vdf.Int64(_) | Vdf.Float32(_) => None
+
+/** Minimal parser for Steam's text VDF format. */
+def parseTextVdf(s: String): Vdf.TextBlock =
   var i = 0
   def skipWs(): Unit =
     while i < s.length && (s(i).isWhitespace || s.startsWith("//", i)) do
@@ -206,22 +256,22 @@ def parseTextVdf(s: String): KV =
       val start = i
       while i < s.length && !s(i).isWhitespace && s(i) != '{' && s(i) != '}' do i += 1
       s.substring(start, i)
-  def obj(): KV =
-    val b = Map.newBuilder[String, Any]
+  def block(): Vdf.TextBlock =
+    val b = Map.newBuilder[VdfKey, Vdf.Value[Vdf.TextLeaf]]
     skipWs()
     while i < s.length && s(i) != '}' do
-      val k = token()
+      val k = VdfKey(token())
       skipWs()
       if i < s.length && s(i) == '{' then
         i += 1
-        b += k -> obj()
+        b += k -> Vdf.Value.Nested(block())
         i += 1 // closing brace
-      else b += k -> token()
+      else b += k -> Vdf.Value.Leaf(Vdf.Str(token()))
       skipWs()
-    b.result()
-  obj()
+    Vdf.Block(b.result())
+  block()
 
-def readTextVdf(file: Path): Option[KV] =
+def readTextVdf(file: Path): Option[Vdf.TextBlock] =
   if !Files.isRegularFile(file) then None else Try(parseTextVdf(Files.readString(file))).toOption
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -230,9 +280,9 @@ def readTextVdf(file: Path): Option[KV] =
 /** Library dirs from steamapps/libraryfolders.vdf (always includes the main Steam dir). */
 def libraryDirs(steamDir: SteamDir): List[LibraryDir] =
   val fromVdf = readTextVdf(steamDir.libraryFoldersVdf).toList
-    .flatMap(_.ci("libraryfolders").flatMap(asKV).toList)
-    .flatMap(_.children)
-    .flatMap(_.str("path"))
+    .flatMap(_.block("libraryfolders"))
+    .flatMap(_.childBlocks)
+    .flatMap((_, library) => library.str("path"))
     .map(p => LibraryDir(Paths.get(p)))
   (steamDir.asLibrary :: fromVdf)
     .map(d => LibraryDir(d.unwrap.toAbsolutePath.normalize))
@@ -275,7 +325,7 @@ def shortcutAppIds(steamDir: SteamDir): Set[AppId] =
   *   binary KV entry: u8 type (0x08 = end of map), key (v29: i32 string table index, else C string), value.
   * Returns an empty map if the file is missing or in an unknown format.
   */
-def appInfos(steamDir: SteamDir, wanted: Set[AppId]): Map[AppId, KV] =
+def appInfos(steamDir: SteamDir, wanted: Set[AppId]): Map[AppId, Vdf.BinaryBlock] =
   val file = steamDir.appInfoVdf
   if wanted.isEmpty || !Files.isRegularFile(file) then return Map.empty
   Try {
@@ -300,43 +350,43 @@ def appInfos(steamDir: SteamDir, wanted: Set[AppId]): Map[AppId, KV] =
         buf.position(saved)
         table
 
-    def key(): String = if version >= 0x29 then stringTable(buf.getInt) else cString()
+    def key(): VdfKey = VdfKey(if version >= 0x29 then stringTable(buf.getInt) else cString())
 
-    /** Parses a map body until 0x08. Values: nested maps, strings (also for numbers), others skipped. */
-    def readMap(): KV =
-      val b = Map.newBuilder[String, Any]
+    /** Parses a block body until 0x08. Pointers, colors and wide strings are skipped (Steam doesn't use them here). */
+    def readBlock(): Vdf.BinaryBlock =
+      val b = Map.newBuilder[VdfKey, Vdf.Value[Vdf.BinaryLeaf]]
       var tpe = buf.get & 0xff
       while tpe != 0x08 do
         val k = key()
         tpe match
-          case 0x00        => b += k -> readMap()
-          case 0x01        => b += k -> cString()
-          case 0x02        => b += k -> buf.getInt.toString
-          case 0x03        => b += k -> buf.getFloat.toString
+          case 0x00        => b += k -> Vdf.Value.Nested(readBlock())
+          case 0x01        => b += k -> Vdf.Value.Leaf(Vdf.Str(cString()))
+          case 0x02        => b += k -> Vdf.Value.Leaf(Vdf.Int32(buf.getInt))
+          case 0x03        => b += k -> Vdf.Value.Leaf(Vdf.Float32(buf.getFloat))
+          case 0x07 | 0x0a => b += k -> Vdf.Value.Leaf(Vdf.Int64(buf.getLong))
           case 0x04 | 0x06 => buf.getInt
-          case 0x07 | 0x0a => b += k -> buf.getLong.toString
           case 0x05        => while buf.getShort != 0 do ()
           case other       => throw IllegalStateException(s"unknown KV type 0x${other.toHexString}")
         tpe = buf.get & 0xff
-      b.result()
+      Vdf.Block(b.result())
 
-    val infos = Map.newBuilder[AppId, KV]
+    val infos = Map.newBuilder[AppId, Vdf.BinaryBlock]
     var appId = AppId.fromUnsignedInt(buf.getInt)
     while appId != AppId.Zero do
       val size = buf.getInt
       val next = buf.position + size
       if wanted.contains(appId) then
         buf.position(buf.position + 4 + 4 + 8 + 20 + 4 + (if version >= 0x28 then 20 else 0))
-        readMap().obj("appinfo").foreach(info => infos += appId -> info)
+        readBlock().block("appinfo").foreach(info => infos += appId -> info)
       buf.position(next)
       appId = AppId.fromUnsignedInt(buf.getInt)
     infos.result()
   }.recover { case e =>
-    System.err.println(s"Warning: could not read Steam app cache $file: $e")
+    System.err.println(s"Warning: could not read Steam app cache ${file.toString}: ${e.getMessage}")
     Map.empty
   }.get
 
-def gameName(info: KV): Option[GameName] = info.str("common", "name").map(GameName(_))
+def gameName(info: Vdf.BinaryBlock): Option[GameName] = info.str("common", "name").map(GameName(_))
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Save data detection
@@ -349,7 +399,7 @@ val saveFolders: List[UserFolder] =
 val notSaves: Set[EntryName] = Set("Microsoft", "Temp", "openvr", "dxvk", "vkd3d", "vkd3d-proton",
   "mesa_shader_cache", "UnrealEngine", "Downloads", "Music", "Pictures", "Templates", "Videos").map(EntryName(_))
 
-enum Cloud:
+enum Cloud derives CanEqual:
   /** An Auto-Cloud rule covers this folder and Steam's last sync for the game succeeded. */
   case Synced
   /** An Auto-Cloud rule covers this folder, but the last sync state is not "synchronized" (or unknown). */
@@ -391,29 +441,27 @@ val cloudRoots: Map[CloudRoot, UserFolder] = Map(
 def cloudSyncStates(steamDir: SteamDir): Map[AppId, List[SyncState]] =
   steamDir.userdataDirs
     .flatMap(user => readTextVdf(user.resolve("config/localconfig.vdf")))
-    .flatMap { vdf =>
-      val apps = vdf.children.flatMap(_.ci("Software", "Valve", "Steam", "apps").flatMap(asKV)).headOption
-      apps.toList.flatMap(_.toList).flatMap { (id, app) =>
-        for
-          appId <- AppId.parse(id)
-          app   <- asKV(app)
-          state <- app.ci("cloud", "last_sync_state").collect { case s: String => SyncState(s) }
-        yield appId -> state
-      }
+    .flatMap(_.block("UserLocalConfigStore", "Software", "Valve", "Steam", "apps").toList)
+    .flatMap(_.childBlocks)
+    .flatMap { (id, app) =>
+      for
+        appId <- AppId.parse(id.unwrap)
+        state <- app.str("cloud", "last_sync_state")
+      yield appId -> SyncState(state)
     }
     .groupMap(_._1)(_._2)
 
 /** Decides whether a prefix entry (`folder`/`entry`) of an app is backed up by Steam Cloud. */
-def cloudStatus(info: Option[KV], syncStates: Map[AppId, List[SyncState]], appId: AppId)(
+def cloudStatus(info: Option[Vdf.BinaryBlock], syncStates: Map[AppId, List[SyncState]], appId: AppId)(
     folder: UserFolder,
     entry: EntryName
 ): Cloud =
-  info.flatMap(_.obj("ufs")) match
+  info.flatMap(_.block("ufs")) match
     case None => Cloud.NoCloud
     case Some(ufs) =>
-      val rules = ufs.obj("savefiles").toList.flatMap(_.children)
+      val rules = ufs.block("savefiles").toList.flatMap(_.childBlocks).map(_._2)
       val covered = rules.exists { rule =>
-        val forWindows = rule.obj("platforms").forall(_.values.exists(v => v == "Windows" || v == "all"))
+        val forWindows = rule.block("platforms").forall(_.strings.exists(p => p == "Windows" || p == "all"))
         val ruleFolder = rule.str("root").map(CloudRoot(_)).flatMap(cloudRoots.get)
         val ruleEntry = rule.str("path").getOrElse("").split("[/\\\\]").headOption.filter(_.nonEmpty)
         forWindows && ruleFolder.contains(folder) && ruleEntry.forall(_.equalsIgnoreCase(entry.unwrap))
@@ -421,7 +469,7 @@ def cloudStatus(info: Option[KV], syncStates: Map[AppId, List[SyncState]], appId
       if !covered then Cloud.NotCovered
       else
         // Demos often sync into the full game's cloud storage.
-        val cloudId = ufs.str("appidredirect").flatMap(AppId.parse).getOrElse(appId)
+        val cloudId = ufs.long("appidredirect").map(AppId(_)).getOrElse(appId)
         val states = syncStates.getOrElse(cloudId, Nil) ++ syncStates.getOrElse(appId, Nil)
         if states.contains(SyncState.Synchronized) then Cloud.Synced else Cloud.Unconfirmed(states.headOption)
 
@@ -500,11 +548,11 @@ def delete(o: Orphan): Bytes =
       println(s"    ${green("✓")} deleted ${dim(l.path.toString)}")
       l.size
     catch case e: Exception =>
-      System.err.println(s"    ${red("✗")} failed to delete ${l.path}: ${e.getMessage}")
+      System.err.println(s"    ${red("✗")} failed to delete ${l.path.toString}: ${e.getMessage}")
       Bytes.Zero
   }.sum
 
-enum Answer:
+enum Answer derives CanEqual:
   case Yes, No, All, Quit
 
 def ask(o: Orphan): Answer =
@@ -530,7 +578,7 @@ def ask(o: Orphan): Answer =
 
   val libraries = libraryDirs(args.steamDir)
   if libraries.isEmpty then
-    System.err.println(s"No Steam libraries found under ${args.steamDir}")
+    System.err.println(s"No Steam libraries found under ${args.steamDir.unwrap.toString}")
     sys.exit(1)
 
   val installed = installedAppIds(libraries)
