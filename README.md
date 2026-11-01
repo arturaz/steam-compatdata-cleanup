@@ -5,6 +5,11 @@ When you uninstall a game, Steam on Linux leaves its Proton prefix (`steamapps/c
 games that are no longer installed and removes them. It also warns you about save files that Steam Cloud has not
 backed up.
 
+For example, here `compatdata` takes 232.6 GiB of a 377.9 GiB `steamapps` directory, much more than the installed
+games in `common` (139.5 GiB):
+
+![Filelight showing compatdata using 232.6 GiB of the 377.9 GiB steamapps directory](docs/filelight.png)
+
 ![The GUI listing leftovers of uninstalled games, with their save status](docs/screenshot.png)
 
 ## Requirements
