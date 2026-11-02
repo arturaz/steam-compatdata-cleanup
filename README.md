@@ -3,14 +3,21 @@
 When you uninstall a game, Steam on Linux leaves its Proton prefix (`steamapps/compatdata/<appid>`) and shader cache
 (`steamapps/shadercache/<appid>`) behind. These can add up to many gigabytes. This script finds the leftovers for
 games that are no longer installed and removes them. It also warns you about save files that Steam Cloud has not
-backed up.
+backed up, and shows which installed apps take up the rest of `compatdata`.
 
-For example, here `compatdata` takes 232.6 GiB of a 377.9 GiB `steamapps` directory, much more than the installed
-games in `common` (139.5 GiB):
+For example, here `compatdata` takes 232.6 GiB of a 377.9 GiB `steamapps` directory, more than `common` (139.5 GiB),
+where Steam installs its games:
 
 ![Filelight showing compatdata using 232.6 GiB of the 377.9 GiB steamapps directory](docs/filelight.png)
 
+Uninstalled games account for only 4.6 GiB of that:
+
 ![The GUI listing leftovers of uninstalled games, with their save status](docs/screenshot.png)
+
+Most of the space, 215.7 GiB, is the prefix of Battle.net, added to Steam as a non-Steam shortcut. Battle.net installs
+its games inside its own prefix, so they show up under `compatdata` instead of `common`. The **Kept** tab shows this:
+
+![The Kept tab, with a Battle.net shortcut's prefix using 215.7 GiB](docs/kept.png)
 
 ## Requirements
 
@@ -44,10 +51,9 @@ toggles the selected rows) and press **Delete selected…**. A confirmation list
 Double-click a game or a save to open its folder.
 
 The **Kept** tab lists the installed games and non-Steam shortcuts that have a prefix or shader cache, largest first.
-These are never deleted, but they show where the rest of `compatdata` goes. For example, a launcher such as Battle.net
-added as a non-Steam shortcut installs its games inside its own prefix, which can take hundreds of gigabytes.
-
-![The Kept tab, with a Battle.net shortcut's prefix using 215.7 GiB](docs/kept.png)
+These are never deleted, but they show where the rest of `compatdata` goes. A launcher such as Battle.net, added as a
+non-Steam shortcut, installs its games inside its own prefix, which can take hundreds of gigabytes (see the example
+above). To free that space, uninstall the games from within the launcher.
 
 If there is no display (for example over SSH), the script prints a dry run in the terminal instead.
 
