@@ -7,12 +7,13 @@ import com.formdev.flatlaf.{FlatDarculaLaf, FlatDarkLaf, FlatIntelliJLaf, FlatLi
 import scala.util.Try
 
 object Gui:
-  def start(steamDir: SteamDir, theme: Theme): Unit =
+  /** `choices` are the Steam installs to offer in the window; with fewer than two there is no selector. */
+  def start(choices: List[SteamDir], steamDir: SteamDir, theme: Theme): Unit =
     // Runs commands, so do it before touching the event thread.
     val dark = theme == Theme.Auto && DesktopDarkMode.prefersDark
     SwingUtilities.invokeLater { () =>
       applyTheme(theme, autoDark = dark)
-      MainWindow(steamDir, theme).show()
+      MainWindow(choices, steamDir, theme).show()
     }
 
   /** Sets the look and feel. Windows that already exist need SwingUtilities.updateComponentTreeUI afterwards. */

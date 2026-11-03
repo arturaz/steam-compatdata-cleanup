@@ -8,7 +8,8 @@ import javax.swing.table.{AbstractTableModel, DefaultTableCellRenderer}
 import scala.collection.mutable.ArrayBuffer
 import scala.util.{Failure, Success, Try}
 
-final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
+final class MainWindow(steamDirs: List[SteamDir], initialSteamDir: SteamDir, initialTheme: Theme):
+  private var steamDir = initialSteamDir
   private var palette = Palette.current()
 
   private def riskColor(risk: Risk): Color = risk match
@@ -101,6 +102,9 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
   private val openButton = JButton("Open folder")
   private val deleteButton = JButton("Delete selected…")
   private val themeBox = JComboBox[Theme](Theme.values)
+  private val steamBox = JComboBox[String](steamDirs.map(steamDirName).toArray)
+  /** Counts scans, so the result of a scan that a newer one replaced (after a Steam switch) is ignored. */
+  private var scanId = 0
   private val detailTitle = JLabel("Details of the selected game")
   private val dimLabels = ArrayBuffer[JLabel](subtitle)
 
@@ -272,6 +276,9 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
     List(selectSafeButton, selectAllButton, selectNoneButton, openButton, deleteButton)
       .foreach(b => { val _ = buttons.add(b) })
     val left = JPanel(FlowLayout(FlowLayout.LEADING, 8, 0))
+    if steamDirs.sizeIs > 1 then
+      val _ = left.add(JLabel("Steam:"))
+      val _ = left.add(steamBox)
     left.add(JLabel("Theme:"))
     left.add(themeBox)
     left.add(status)
@@ -290,6 +297,10 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
     themeBox.setSelectedItem(initialTheme)
     themeBox.setToolTipText("Auto follows the desktop's dark mode setting")
     themeBox.addActionListener(_ => switchTheme())
+    steamBox.setSelectedIndex(steamDirs.indexOf(initialSteamDir))
+    steamBox.setToolTipText(steamDirs.map(d => escapeHtml(describeSteamDir(d)))
+      .mkString("<html>Several Steam installs were found; pick the one to clean up:<br>", "<br>", "</html>"))
+    steamBox.addActionListener(_ => switchSteam())
     styleLabels()
 
     val content = frame.getContentPane
@@ -305,19 +316,48 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
     frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE)
     frame.setSize(1150, 760)
     frame.setLocationRelativeTo(null)
-    setBusy(true)
-    progress.setIndeterminate(true)
-    refresh()
     frame.setVisible(true)
-    inBackground(scan(steamDir)) {
-      case Success(Right(result)) => loaded(result)
-      case Success(Left(error))   => fatal(error)
-      case Failure(e)             => fatal(s"Scanning failed: ${e.toString}")
+    startScan()
+
+  private def switchSteam(): Unit =
+    steamDirs.lift(steamBox.getSelectedIndex).filter(_ != steamDir).foreach { dir =>
+      steamDir = dir
+      startScan()
     }
 
-  private def fatal(message: String): Unit =
+  /** Clears the lists and scans `steamDir` in the background. */
+  private def startScan(): Unit =
+    scanId += 1
+    val id = scanId
+    scanned = None
+    rows.clear()
+    kept = Vector.empty
+    freed = Bytes.Zero
+    gameModel.fireTableDataChanged()
+    keptModel.fireTableDataChanged()
+    showDetails()
+    title.setText("Scanning Steam libraries…")
+    subtitle.setText(" ")
+    status.setText(" ")
+    tabs.setTitleAt(0, "Uninstalled")
+    tabs.setTitleAt(1, "Kept")
+    setBusy(true)
+    progress.setIndeterminate(true)
+    val dir = steamDir
+    inBackground(scan(dir)) { result =>
+      if id == scanId then
+        result match
+          case Success(Right(result)) => loaded(result)
+          case Success(Left(error))   => scanFailed(error)
+          case Failure(e)             => scanFailed(s"Scanning failed: ${e.toString}")
+    }
+
+  /** With other Steam installs to pick from, shows the error and stays open; otherwise there is nothing to show. */
+  private def scanFailed(message: String): Unit =
     JOptionPane.showMessageDialog(frame, message, frame.getTitle, JOptionPane.ERROR_MESSAGE)
-    sys.exit(1)
+    if steamDirs.sizeIs < 2 then sys.exit(1)
+    title.setText("Could not scan this Steam install")
+    setBusy(false)
 
   private def loaded(result: Scan): Unit =
     scanned = Some(result)
@@ -332,6 +372,7 @@ final class MainWindow(steamDir: SteamDir, initialTheme: Theme):
     busy = value
     progress.setVisible(value)
     gameTable.setEnabled(!value)
+    steamBox.setEnabled(!value)
     refresh()
 
   /** Updates the header, footer and buttons from the current rows. */

@@ -52,6 +52,7 @@ type EntryName = EntryName.Type
 
 /** The Steam installation directory (the one with userdata/, appcache/, ...). */
 object SteamDir extends Newtype.WithoutValidationOf[Path]:
+  given CanEqual[SteamDir, SteamDir] = CanEqual.derived
   extension (d: SteamDir)
     def userdataDirs: List[Path] = listDir(d.unwrap.resolve("userdata"))
     def appInfoVdf: Path = d.unwrap.resolve("appcache/appinfo.vdf")

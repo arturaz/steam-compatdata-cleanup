@@ -22,7 +22,8 @@ enum Theme derives CanEqual:
 object Theme:
   def parse(s: String): Option[Theme] = values.find(_.toString.equalsIgnoreCase(s))
 
-case class Args(steamDir: SteamDir, mode: Mode, theme: Theme)
+/** `steamDir` is None unless --steam-dir was given; then the script looks for Steam installs and lets you pick. */
+case class Args(steamDir: Option[SteamDir], mode: Mode, theme: Theme)
 
 /** The comment lines between `// help:begin` and `// help:end` in cleanup.scala, read from the source scala-cli
   * reports.
@@ -43,7 +44,7 @@ def parseArgs(args: List[String], acc: Args): Args = args match
   case "--cli" :: rest                  => parseArgs(rest, acc.copy(mode = Mode.Cli(CliAction.DryRun)))
   case "--delete" :: rest               => parseArgs(rest, acc.copy(mode = Mode.Cli(CliAction.Delete)))
   case ("--interactive" | "-i") :: rest => parseArgs(rest, acc.copy(mode = Mode.Cli(CliAction.Interactive)))
-  case "--steam-dir" :: dir :: rest     => parseArgs(rest, acc.copy(steamDir = SteamDir(Paths.get(dir))))
+  case "--steam-dir" :: dir :: rest     => parseArgs(rest, acc.copy(steamDir = Some(SteamDir(Paths.get(dir)))))
   case "--theme" :: name :: rest =>
     Theme.parse(name) match
       case Some(theme) => parseArgs(rest, acc.copy(theme = theme))

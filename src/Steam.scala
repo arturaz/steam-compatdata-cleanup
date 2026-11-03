@@ -1,15 +1,76 @@
-import java.nio.file.{Files, Paths}
+import java.nio.file.{Files, Path, Paths}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets
 import scala.util.Try
 
+private def home: Path = Paths.get(sys.props("user.home"))
+
+/** Where Flatpak Steam (com.valvesoftware.Steam) keeps its home directory. */
+private def flatpakHome: Path = home.resolve(".var/app/com.valvesoftware.Steam")
+
+/** Steam directories that exist: native first, then Flatpak (newer and older layouts), without duplicates. */
+def steamDirCandidates: List[SteamDir] =
+  List(home.resolve(".local/share/Steam"), flatpakHome.resolve(".local/share/Steam"), flatpakHome.resolve("data/Steam"))
+    .filter(d => Files.isDirectory(d.resolve("steamapps")))
+    .distinctBy(d => Try(d.toRealPath()).getOrElse(d))
+    .map(SteamDir(_))
+
+/** The Steam directories to offer, and the one to start with: the one Steam used most recently (it rewrites
+  * config/config.vdf). If none is found, the native path, so the scan reports that it has no libraries.
+  */
+def steamDirChoices: (List[SteamDir], SteamDir) =
+  def lastUsed(d: SteamDir) =
+    Try(Files.getLastModifiedTime(d.unwrap.resolve("config/config.vdf")).toMillis).getOrElse(0L)
+  val candidates = steamDirCandidates
+  candidates match
+    case Nil => (Nil, SteamDir(home.resolve(".local/share/Steam")))
+    case _   => (candidates, candidates.maxBy(lastUsed))
+
+/** The Steam dir with the home directory shown as `~`. */
+def shortSteamPath(steamDir: SteamDir): String =
+  val dir = steamDir.unwrap.toAbsolutePath.normalize
+  if dir.startsWith(home) then s"~/${home.relativize(dir).toString}" else dir.toString
+
+/** "Native Steam", "Flatpak Steam", or the path for any other directory. */
+def steamDirName(steamDir: SteamDir): String =
+  if flatpakSandboxHome(steamDir).isDefined then "Flatpak Steam"
+  else if steamDir.unwrap.toAbsolutePath.normalize.equals(home.resolve(".local/share/Steam")) then "Native Steam"
+  else shortSteamPath(steamDir)
+
+/** "Native Steam (~/.local/share/Steam)", "Flatpak Steam (~/.var/app/…)" or the path for any other directory. */
+def describeSteamDir(steamDir: SteamDir): String =
+  val name = steamDirName(steamDir)
+  val path = shortSteamPath(steamDir)
+  if name == path then path else s"$name ($path)"
+
+/** The sandbox home directory (`~/.var/app/<id>`) if the Steam dir belongs to a Flatpak app. */
+def flatpakSandboxHome(steamDir: SteamDir): Option[Path] =
+  val apps = home.resolve(".var/app")
+  val dir = steamDir.unwrap.toAbsolutePath.normalize
+  Option.when(dir.startsWith(apps) && dir.getNameCount > apps.getNameCount)(
+    apps.resolve(dir.getName(apps.getNameCount))
+  )
+
+/** Flatpak Steam sees its sandbox home (`~/.var/app/<id>`) as `~`, so libraryfolders.vdf lists paths such as
+  * `~/.local/share/Steam` that mean something else on the host (possibly a native Steam install). Maps such a path
+  * into the sandbox home when it has a library there. Paths shared with the sandbox (other drives, or folders the user
+  * exposed with --filesystem) are the same inside and outside, so they are kept as they are.
+  */
+private def hostLibraryPath(sandboxHome: Option[Path], path: Path): Path =
+  sandboxHome
+    .filter(_ => path.startsWith(home) && !path.startsWith(home.resolve(".var/app")))
+    .map(_.resolve(home.relativize(path)))
+    .filter(p => Files.isDirectory(p.resolve("steamapps")))
+    .getOrElse(path)
+
 /** Library dirs from steamapps/libraryfolders.vdf (always includes the main Steam dir). */
 def libraryDirs(steamDir: SteamDir): List[LibraryDir] =
+  val sandboxHome = flatpakSandboxHome(steamDir)
   val fromVdf = readTextVdf(steamDir.libraryFoldersVdf).toList
     .flatMap(_.block("libraryfolders"))
     .flatMap(_.childBlocks)
     .flatMap((_, library) => library.str("path"))
-    .map(p => LibraryDir(Paths.get(p)))
+    .map(p => LibraryDir(hostLibraryPath(sandboxHome, Paths.get(p).toAbsolutePath.normalize)))
   (steamDir.asLibrary :: fromVdf)
     .map(d => LibraryDir(d.unwrap.toAbsolutePath.normalize))
     .distinct

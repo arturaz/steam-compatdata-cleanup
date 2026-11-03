@@ -30,7 +30,11 @@ its games inside its own prefix, so they show up under `compatdata` instead of `
   `kdialog`, `zenity`, `xmessage` or `notify-send`, whichever is available (`osascript` on macOS). Because desktop
   launchers often do not load your shell's `PATH`, the script also looks for scala-cli in the usual install locations
   (coursier, SDKMAN!, Nix, Homebrew, `~/.local/bin`, `/usr/local/bin`).
-- Linux with native Steam at `~/.local/share/Steam`, or another Steam directory passed with `--steam-dir`.
+- Linux with native Steam (`~/.local/share/Steam`), Flatpak Steam (`~/.var/app/com.valvesoftware.Steam/.local/share/Steam`),
+  or another Steam directory passed with `--steam-dir`. If both native and Flatpak Steam are present, the GUI has a
+  **Steam** dropdown to switch between them, and the terminal modes ask which one to use (the one Steam ran last is
+  the default; without a terminal to ask in, that one is used). Flatpak Steam records its libraries with paths as seen inside the sandbox, and the script
+  maps them back to the real folders.
 
 ## Usage
 

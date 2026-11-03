@@ -87,7 +87,40 @@ def ask(o: Orphan): Answer =
     case Some("q" | "quit") => Answer.Quit
     case Some(_)            => Answer.No
 
-def runCli(steamDir: SteamDir, action: CliAction): Unit =
+/** The --steam-dir directory, or the Steam install to use. With several installs it asks in a terminal, and
+  * otherwise uses the one Steam ran last and says so.
+  */
+def pickSteamDir(fromArgs: Option[SteamDir]): SteamDir = fromArgs.getOrElse {
+  val (choices, initial) = steamDirChoices
+  if choices.sizeIs < 2 then initial
+  else if System.console() == null then
+    System.err.println(s"Found several Steam installs; using ${describeSteamDir(initial)}. " +
+      "Pass --steam-dir to pick another one.")
+    initial
+  else
+    println(bold("Found several Steam installs:"))
+    choices.zipWithIndex.foreach { (dir, i) =>
+      val note = if dir == initial then dim("  (used last)") else ""
+      println(s"  ${i + 1}) ${describeSteamDir(dir)}$note")
+    }
+    val default = choices.indexOf(initial) + 1
+    def loop(): SteamDir =
+      print(s"Which one? ${dim(s"[1-${choices.size}, Enter for $default, q to quit]")} ")
+      Console.flush()
+      Option(scala.io.StdIn.readLine()).map(_.trim.toLowerCase) match
+        case None | Some("q" | "quit") => sys.exit(0)
+        case Some("")                  => initial
+        case Some(s) =>
+          s.toIntOption.filter(n => n >= 1 && n <= choices.size) match
+            case Some(n) => choices(n - 1)
+            case None    => println(red(s"Enter a number from 1 to ${choices.size}.")); loop()
+    val chosen = loop()
+    println()
+    chosen
+}
+
+def runCli(givenSteamDir: Option[SteamDir], action: CliAction): Unit =
+  val steamDir = pickSteamDir(givenSteamDir)
   val result = scan(steamDir) match
     case Left(error) =>
       System.err.println(error)

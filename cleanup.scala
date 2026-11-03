@@ -77,6 +77,10 @@
 //   ./cleanup.scala --delete         # terminal: delete everything listed, no questions
 //   ./cleanup.scala --steam-dir /path/to/Steam
 //
+// Without --steam-dir it uses native Steam (~/.local/share/Steam) or Flatpak Steam
+// (~/.var/app/com.valvesoftware.Steam/.local/share/Steam), whichever exists. If both do, it lets you pick: a
+// "Steam" dropdown in the GUI, a question in the terminal (starting with the one Steam used last).
+//
 // An app is considered installed if any Steam library has steamapps/appmanifest_<appid>.acf.
 //
 // Non-Steam shortcuts (from userdata/*/config/shortcuts.vdf) and appid 0 are always kept. Kept apps are listed with
@@ -95,8 +99,7 @@ import scala.util.Try
 @main def run(rawArgs: String*): Unit =
   // Tells the shell bootstrap that scala-cli is done preparing, which closes its "Starting…" notification.
   sys.env.get("CLEANUP_STARTING_FILE").foreach(file => Try(Files.deleteIfExists(Paths.get(file))))
-  val defaultSteamDir = SteamDir(Paths.get(sys.props("user.home"), ".local/share/Steam"))
-  val args = parseArgs(rawArgs.toList, Args(defaultSteamDir, Mode.Gui, Theme.Auto))
+  val args = parseArgs(rawArgs.toList, Args(None, Mode.Gui, Theme.Auto))
 
   args.mode match
     case Mode.Cli(action) => runCli(args.steamDir, action)
@@ -104,4 +107,6 @@ import scala.util.Try
       System.err.println("No display found, so showing a dry run in the terminal. Pass --cli to skip this check.")
       runCli(args.steamDir, CliAction.DryRun)
     case Mode.Gui =>
-      if !(needsNonReparentingRelaunch && relaunchNonReparenting(rawArgs)) then Gui.start(args.steamDir, args.theme)
+      if !(needsNonReparentingRelaunch && relaunchNonReparenting(rawArgs)) then
+        val (choices, initial) = args.steamDir.fold(steamDirChoices)(dir => (List(dir), dir))
+        Gui.start(choices, initial, args.theme)
